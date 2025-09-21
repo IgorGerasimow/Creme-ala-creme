@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="820" viewBox="0 0 1100 820">
+  <defs>
+    <style type="text/css"><![CDATA[
+      .box { fill: #f8fafc; stroke: #0ea5e9; stroke-width: 2; rx: 8; ry: 8; }
+      .title { font: 700 16px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; fill: #0f172a; }
+      .text { font: 13px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; fill: #334155; }
+      .ok { fill: #16a34a; }
+      .todo { fill: #f59e0b; }
+    ]]></style>
+  </defs>
+
+  <rect x="40" y="30" width="1020" height="760" class="box"/>
+  <text x="60" y="60" class="title">12-Factor App Overview (hello-world)</text>
+
+  <!-- Codebase -->
+  <text x="60" y="100" class="title">I. Codebase</text>
+  <circle cx="40" cy="95" r="6" class="ok"/>
+  <text x="220" y="100" class="text">Single repo, trunk-based, CI enforced</text>
+
+  <!-- Dependencies -->
+  <text x="60" y="135" class="title">II. Dependencies</text>
+  <circle cx="40" cy="130" r="6" class="ok"/>
+  <text x="220" y="135" class="text">Go modules, pinned in go.mod</text>
+
+  <!-- Config -->
+  <text x="60" y="170" class="title">III. Config</text>
+  <circle cx="40" cy="165" r="6" class="todo"/>
+  <text x="220" y="170" class="text">Env vars; secrets TBD (ESO/Vault)</text>
+
+  <!-- Backing services -->
+  <text x="60" y="205" class="title">IV. Backing services</text>
+  <circle cx="40" cy="200" r="6" class="ok"/>
+  <text x="220" y="205" class="text">Postgres, Prometheus, OTel Collector as attached resources</text>
+
+  <!-- Build, release, run -->
+  <text x="60" y="240" class="title">V. Build, release, run</text>
+  <circle cx="40" cy="235" r="6" class="ok"/>
+  <text x="220" y="240" class="text">CI builds immutable image, signs (emulated), pushes to ECR, deploys</text>
+
+  <!-- Processes -->
+  <text x="60" y="275" class="title">VI. Processes</text>
+  <circle cx="40" cy="270" r="6" class="ok"/>
+  <text x="220" y="275" class="text">Stateless HTTP; migrations run externally (preferred)</text>
+
+  <!-- Port binding -->
+  <text x="60" y="310" class="title">VII. Port binding</text>
+  <circle cx="40" cy="305" r="6" class="ok"/>
+  <text x="220" y="310" class="text">Service on :8080; metrics at /metrics</text>
+
+  <!-- Concurrency -->
+  <text x="60" y="345" class="title">VIII. Concurrency</text>
+  <circle cx="40" cy="340" r="6" class="ok"/>
+  <text x="220" y="345" class="text">Kubernetes replicas/HPA (chart-ready)</text>
+
+  <!-- Disposability -->
+  <text x="60" y="380" class="title">IX. Disposability</text>
+  <circle cx="40" cy="375" r="6" class="todo"/>
+  <text x="220" y="380" class="text">Graceful shutdown and probes TBD</text>
+
+  <!-- Dev/Prod parity -->
+  <text x="60" y="415" class="title">X. Dev/Prod parity</text>
+  <circle cx="40" cy="410" r="6" class="ok"/>
+  <text x="220" y="415" class="text">Docker Compose locally; CI+K8s in prod</text>
+
+  <!-- Logs -->
+  <text x="60" y="450" class="title">XI. Logs</text>
+  <circle cx="40" cy="445" r="6" class="todo"/>
+  <text x="220" y="450" class="text">Structured JSON logs + trace IDs TBD</text>
+
+  <!-- Admin processes -->
+  <text x="60" y="485" class="title">XII. Admin processes</text>
+  <circle cx="40" cy="480" r="6" class="ok"/>
+  <text x="220" y="485" class="text">Runtime flags admin endpoints; migrations via CI tools</text>
+
+  <!-- Feature Flags -->
+  <rect x="60" y="530" width="950" height="220" class="box"/>
+  <text x="80" y="560" class="title">Feature Flags</text>
+  <text x="80" y="585" class="text">• OpenFeature + flagd: tracing_enabled, metrics_enabled (dynamic, prod)</text>
+  <text x="80" y="610" class="text">• Admin endpoints (dev): /admin/flags, /admin/flags/reset</text>
+  <text x="80" y="635" class="text">• Env defaults: ENABLE_TRACING, ENABLE_METRICS; ADMIN_FLAGS_ENABLED for local</text>
+  <text x="80" y="660" class="text">• OTEL_EXPORTER_OTLP_ENDPOINT for tracing; /metrics gated per-request</text>
+</svg>

@@ -1,0 +1,77 @@
+version: "3.8"
+
+services:
+  hello-world:
+    build:
+      context: ./hello-world
+      dockerfile: Dockerfile
+    image: hello-world:local
+    environment:
+      - PORT=8080
+      - DATABASE_URL=postgres://hello:hello@db:5432/hellodb?sslmode=disable
+      # Feature flags (optional): set to "true" to enable
+      - ENABLE_TRACING=true
+      - ENABLE_METRICS=true
+      # OTLP HTTP endpoint for OpenTelemetry exporter
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_SERVICE_NAME=hello-world
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.99.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC (optional)
+      - "4318:4318"   # OTLP HTTP
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    ports:
+      - "16686:16686"  # Jaeger UI
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./hello-world/monitoring/prometheus-rules.yaml:/etc/prometheus/rules/hello-world-rules.yaml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - hello-world
+      - alertmanager
+
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: hellodb
+      POSTGRES_USER: hello
+      POSTGRES_PASSWORD: hello
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "hello"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+

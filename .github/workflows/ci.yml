@@ -1,0 +1,290 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+### I added the variables here but this is bad practice - all vars should be on oar level and level of repository
+env:
+  AWS_REGION: eu-central-1 
+  ECR_REPOSITORY: <your-ecr-repo-name>  # of cource real name
+  IMAGE_NAME: hello-world
+  PROM_RULES_NAMESPACE: monitoring
+  PROM_OPERATOR_RELEASE_LABEL: kube-prometheus-stack
+
+jobs:
+  lint-build-test:
+    runs-on: [self-hosted, linux, x64] #self-hosted because of kubernetes and ECR access
+    defaults:
+      run:
+        working-directory: hello-world
+    env:
+      DB_MIGRATION_URL: ${{ secrets.DB_MIGRATION_URL }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Run Go Linter (golangci-lint)
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.55
+          working-directory: hello-world
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt check
+        run: |
+          fmt_out=$(gofmt -s -l .) || true
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not formatted:" >&2
+            echo "$fmt_out" >&2
+            exit 1
+          fi
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      - name: Run gosec (SAST)
+        run: $(go env GOPATH)/bin/gosec ./...
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck (SCA)
+        run: $(go env GOPATH)/bin/govulncheck ./...
+
+      - name: Trivy filesystem scan (CVE check for app code)
+        uses: aquasecurity/trivy-action@v0.17.0
+        with:
+          scan-type: 'fs'
+          path: '.'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Run unit tests
+        run: go test ./...
+
+      - name: Build Docker image
+        run: docker build -t $IMAGE_NAME:ci .
+
+      - name: Run Trivy scan (CVE check for image)
+        uses: aquasecurity/trivy-action@v0.17.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:ci
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Integration test - run container and check /metrics
+        run: |
+          set -euo pipefail
+          CONTAINER_NAME=hello-world-ci-test
+          docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+          trap 'docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true' EXIT
+          docker run -d --rm --name "$CONTAINER_NAME" -p 18080:8080 \
+            -e PORT=8080 -e ENABLE_METRICS=true $IMAGE_NAME:ci
+          # wait for readiness
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/metrics >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          # generate a request for metrics labels
+          curl -fsS http://127.0.0.1:18080/ >/dev/null
+          # assert /metrics contains our counter with labels
+          curl -fsS http://127.0.0.1:18080/metrics | tee metrics.txt
+          grep -q 'http_requests_total{handler="/",method="GET",status="200"}' metrics.txt || {
+            echo 'Expected metric series not found in /metrics'
+            docker logs "$CONTAINER_NAME" || true
+            exit 1
+          }
+          # cleanup handled by trap
+
+      - name: Start container for DAST
+        run: |
+          docker rm -f hello-ci >/dev/null 2>&1 || true
+          docker run -d --rm -p 8080:8080 --name hello-ci $IMAGE_NAME:ci
+          for i in {1..30}; do
+            if curl -fsS http://localhost:8080/ >/dev/null 2>&1; then
+              echo "App is up"; break; fi; sleep 1; done
+          curl -fsS http://localhost:8080/ || (echo "App did not start" >&2; docker logs hello-ci; exit 1)
+
+      - name: OWASP ZAP Baseline (DAST)
+        uses: zaproxy/action-baseline@v0.10.0
+        continue-on-error: true
+        with:
+          target: 'http://localhost:8080'
+          cmd_options: '-m 1'
+
+      - name: Stop DAST container
+        if: always()
+        run: docker rm -f hello-ci || true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine image tag
+        run: |
+          REF="${GITHUB_REF}"
+          if [[ "$REF" == refs/tags/* ]]; then
+            TAG="${REF#refs/tags/}"
+            TAG="${TAG#release/}"
+            echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
+            echo "PUSH_LATEST=true" >> $GITHUB_ENV
+          elif [[ "$REF" == "refs/heads/main" ]]; then
+            echo "IMAGE_TAG=latest" >> $GITHUB_ENV
+            echo "PUSH_LATEST=true" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=sha-${GITHUB_SHA}" >> $GITHUB_ENV
+            echo "PUSH_LATEST=false" >> $GITHUB_ENV
+          fi
+
+      - name: Emulate image signing
+        run: |
+          echo "IMAGE_SIGNED=true" >> $GITHUB_ENV
+          echo "signed-by=example-cert" > image.signature
+
+      - name: Verify signature (gate push)
+        run: |
+          test -f image.signature || { echo "Signature missing" >&2; exit 1; }
+
+      - name: Get AWS ECR login password and login
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release/')) && env.IMAGE_SIGNED == 'true'
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | \
+            docker login --username AWS --password-stdin $(aws sts get-caller-identity --query 'Account' --output text).dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Set ECR registry env
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release/')) && env.IMAGE_SIGNED == 'true'
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+          echo "ECR_REGISTRY=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com" >> $GITHUB_ENV
+
+      - name: Tag and push Docker image
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release/')) && env.IMAGE_SIGNED == 'true'
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          docker tag $IMAGE_NAME:ci $ECR_REGISTRY/$ECR_REPOSITORY:${IMAGE_TAG}
+          docker tag $IMAGE_NAME:ci $ECR_REGISTRY/$ECR_REPOSITORY:sha-${GITHUB_SHA}
+          if [[ "${PUSH_LATEST}" == "true" ]]; then
+            docker tag $IMAGE_NAME:ci $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          fi
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${IMAGE_TAG}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:sha-${GITHUB_SHA}
+          if [[ "${PUSH_LATEST}" == "true" ]]; then
+            docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          fi
+
+      - name: Run DB migrations (prod)
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release/')) && env.DB_MIGRATION_URL != ''
+        working-directory: ${{ github.workspace }}
+        env:
+          DATABASE_URL: ${{ env.DB_MIGRATION_URL }}
+        run: |
+          set -euo pipefail
+          test -d hello-world/migrations || { echo "migrations dir not found"; exit 1; }
+          docker run --rm \
+            -v "$PWD/hello-world/migrations:/migrations:ro" \
+            -e DATABASE_URL="$DATABASE_URL" \
+            migrate/migrate:v4.17.0 \
+            -path=/migrations -database "$DATABASE_URL" up
+
+      - name: Validate alerting rules with promtool
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release/')
+        working-directory: ${{ github.workspace }}
+        run: |
+          docker run --rm -v "$PWD/hello-world/monitoring:/rules:ro" prom/prometheus:latest \
+            promtool check rules /rules/prometheus-rules.yaml
+
+      - name: Install kubectl
+        if: github.ref == 'refs/heads/main'
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.4"
+
+  pr-image-push:
+    needs: lint-build-test
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, linux, x64]
+    defaults:
+      run:
+        working-directory: hello-world
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build PR Docker image
+        run: docker build -t $IMAGE_NAME:pr-${{ github.event.number }} .
+
+      - name: Emulate image signing (PR)
+        run: |
+          echo "IMAGE_SIGNED=true" >> $GITHUB_ENV
+          echo "signed-by=example-cert" > image.signature
+
+      - name: Verify signature (gate push)
+        run: test -f image.signature
+
+      - name: ECR login (PR)
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | \
+            docker login --username AWS --password-stdin $(aws sts get-caller-identity --query 'Account' --output text).dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Set ECR registry env (PR)
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+          echo "ECR_REGISTRY=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com" >> $GITHUB_ENV
+
+      - name: Push PR image
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          docker tag $IMAGE_NAME:pr-${{ github.event.number }} $ECR_REGISTRY/$ECR_REPOSITORY:pr-${{ github.event.number }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:pr-${{ github.event.number }}
+
+  deploy:
+    needs: lint-build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure kubectl available
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.4"
+
+      - name: Apply Kubernetes manifests (GitOps/Flux if present)
+        run: |
+          set -euo pipefail
+          if ! command -v kubectl >/dev/null 2>&1; then
+            echo "kubectl not found, skipping deploy"; exit 0; fi
+          # verify cluster connectivity
+          if ! kubectl cluster-info >/dev/null 2>&1; then
+            echo "No cluster access from runner, skipping deploy"; exit 0; fi
+          # Apply Flux GitRepository and HelmRelease if they exist
+          if [ -f hello-world/deploy/flux/platform-design-gitrepository.yaml ]; then
+            kubectl apply -f hello-world/deploy/flux/platform-design-gitrepository.yaml
+          fi
+          if [ -f hello-world/deploy/flux/hello-world-helmrelease.yaml ]; then
+            kubectl apply -f hello-world/deploy/flux/hello-world-helmrelease.yaml
+          fi
+          echo "Deploy step complete"
+

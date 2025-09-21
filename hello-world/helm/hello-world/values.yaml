@@ -1,0 +1,88 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/your-org/hello-world
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+
+containerPort: 8080
+
+resources:
+  requests:
+    cpu: "50m"
+    memory: "64Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+
+podAnnotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+ingress:
+  enabled: false
+  className: ""
+  hosts: []
+  tls: []
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  path: /metrics
+
+networkPolicy:
+  enabled: true
+  defaultDeny: true
+  allowEgress:
+    - toNamespaceSelector: {}
+      toPodSelector:
+        matchLabels:
+          app: postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    - toNamespaceSelector: {}
+      toPodSelector:
+        matchLabels:
+          app: otel-collector
+      ports:
+        - port: 4317
+          protocol: TCP
+
+env:
+  - name: PORT
+    value: "8080"
+  # Example: ensure DATABASE_URL is supplied via Secret in real envs
+  # - name: DATABASE_URL
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: hello-world-db
+  #       key: url

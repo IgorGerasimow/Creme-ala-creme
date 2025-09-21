@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="680" viewBox="0 0 1100 680">
+  <defs>
+    <style type="text/css"><![CDATA[
+      .box { fill: #f7f7ff; stroke: #4f46e5; stroke-width: 2; rx: 8; ry: 8; }
+      .title { font: 700 16px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; fill: #111827; }
+      .text { font: 13px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; fill: #374151; }
+      .arrow { stroke: #111827; stroke-width: 2; marker-end: url(#arrowhead); }
+      .note { font: 12px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; fill: #6b7280; }
+    ]]></style>
+    <marker id="arrowhead" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#111827" />
+    </marker>
+  </defs>
+
+  <!-- Dev/PR -->
+  <rect x="30" y="40" width="220" height="90" class="box"/>
+  <text x="50" y="70" class="title">Developer</text>
+  <text x="50" y="95" class="text">Short-lived branch ➜ PR to main</text>
+
+  <!-- CI -->
+  <rect x="290" y="20" width="320" height="220" class="box"/>
+  <text x="310" y="50" class="title">CI (GitHub Actions)</text>
+  <text x="310" y="78" class="text">• golangci-lint, go vet, gofmt</text>
+  <text x="310" y="98" class="text">• gosec (SAST), govulncheck (SCA)</text>
+  <text x="310" y="118" class="text">• Trivy fs (code CVEs)</text>
+  <text x="310" y="138" class="text">• Build image (hello-world)</text>
+  <text x="310" y="158" class="text">• Trivy image (CRITICAL,HIGH)</text>
+  <text x="310" y="178" class="text">• DAST (OWASP ZAP baseline)</text>
+  <text x="310" y="198" class="text">• Sign gate (emulated)</text>
+
+  <!-- ECR -->
+  <rect x="650" y="40" width="200" height="90" class="box"/>
+  <text x="670" y="70" class="title">AWS ECR</text>
+  <text x="670" y="95" class="text">Signed images only</text>
+
+  <!-- Deploy -->
+  <rect x="890" y="20" width="180" height="140" class="box"/>
+  <text x="905" y="50" class="title">Deploy (main)</text>
+  <text x="905" y="80" class="text">kubectl / Flux apply</text>
+  <text x="905" y="100" class="text">HelmRelease / GitOps</text>
+
+  <!-- Cluster -->
+  <rect x="650" y="190" width="420" height="300" class="box"/>
+  <text x="670" y="220" class="title">Kubernetes (prod)</text>
+  <text x="670" y="245" class="text">hello-world (Go, port 8080)</text>
+  <text x="670" y="265" class="text">Feature flags: OpenFeature + flagd</text>
+  <text x="670" y="285" class="text">/metrics (Prometheus), OTLP → Collector</text>
+  <text x="670" y="305" class="text">Prometheus Operator, Alertmanager</text>
+  <text x="670" y="325" class="text">Jaeger via OTel Collector</text>
+
+  <!-- Observability side -->
+  <rect x="670" y="350" width="180" height="100" class="box"/>
+  <text x="690" y="380" class="title">Prometheus</text>
+  <text x="690" y="405" class="text">Scrapes /metrics</text>
+
+  <rect x="870" y="350" width="180" height="100" class="box"/>
+  <text x="890" y="380" class="title">OTel Collector</text>
+  <text x="890" y="405" class="text">Exports to Jaeger</text>
+
+  <!-- Arrows -->
+  <line x1="250" y1="85" x2="290" y2="85" class="arrow"/>
+  <line x1="610" y1="110" x2="650" y2="110" class="arrow"/>
+  <line x1="850" y1="90" x2="890" y2="90" class="arrow"/>
+  <line x1="740" y1="210" x2="740" y2="350" class="arrow"/>
+  <line x1="980" y1="210" x2="980" y2="350" class="arrow"/>
+
+  <!-- Notes -->
+  <text x="30" y="160" class="note">PR builds also push pr-<num> images for ephemeral tests</text>
+  <text x="30" y="180" class="note">Main branch is the trunk; protected checks enforced</text>
+</svg>

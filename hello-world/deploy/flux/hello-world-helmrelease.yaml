@@ -1,0 +1,38 @@
+# NOTE: You can alternatively point chart.spec.chart to './hello-world/helm/hello-world' if using a Mono-repo GitRepository.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: hello-world
+  namespace: hello-world
+spec:
+  releaseName: hello-world
+  targetNamespace: hello-world
+  interval: 5m
+  chart:
+    spec:
+      chart: helm/app
+      sourceRef:
+        kind: GitRepository
+        name: platform-design
+        namespace: flux-system
+      interval: 1m
+  install:
+    createNamespace: true
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  values:
+    replicaCount: 1
+    image:
+      repository: 000000000000.dkr.ecr.eu-central-1.amazonaws.com/<your-ecr-repo-name>
+      tag: latest
+      pullPolicy: IfNotPresent
+    containerPort: 8080
+    service:
+      type: ClusterIP
+      port: 80
+    ingress:
+      enabled: false
+

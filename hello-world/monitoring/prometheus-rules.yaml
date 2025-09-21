@@ -1,0 +1,71 @@
+groups:
+  - name: hello-world.general
+    rules:
+      - alert: HelloWorldTargetDown
+        expr: up{job=~".*hello-world.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: hello-world
+        annotations:
+          summary: "hello-world target down"
+          description: |
+            No scrape targets are up for hello-world for more than 2 minutes.
+            This usually indicates the service is unavailable or scraping is misconfigured.
+
+      - alert: HelloWorldHighErrorRate
+        expr: |
+          (sum(rate(http_requests_total{job=~".*hello-world.*",status!~"2.."}[5m])) by (job))
+          /
+          (sum(rate(http_requests_total{job=~".*hello-world.*"}[5m])) by (job))
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          service: hello-world
+        annotations:
+          summary: "hello-world high error rate (>5% over 5m)"
+          description: |
+            The proportion of non-2xx responses exceeded 5% over the last 5 minutes.
+            Investigate recent deployments, dependencies and upstreams.
+
+      - alert: HelloWorldHighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, job) (rate(http_request_duration_seconds_bucket{job=~".*hello-world.*"}[5m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          service: hello-world
+        annotations:
+          summary: "hello-world P95 latency high (>500ms over 5m)"
+          description: |
+            The 95th percentile latency is above 500ms over the last 5 minutes.
+            Check resource saturation and downstream dependencies.
+
+      - alert: HelloWorldNoTraffic
+        expr: sum(rate(http_requests_total{job=~".*hello-world.*"}[10m])) by (job) == 0
+        for: 10m
+        labels:
+          severity: info
+          service: hello-world
+        annotations:
+          summary: "hello-world has no traffic"
+          description: |
+            No requests observed for 10 minutes. If this is unexpected, check routing and ingress.
+
+      - alert: HelloWorldMetricsHandlerErrors
+        expr: increase(promhttp_metric_handler_errors_total{job=~".*hello-world.*"}[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: hello-world
+        annotations:
+          summary: "hello-world metrics handler errors detected"
+          description: |
+            The metrics endpoint reported encoding/serving errors in the last 10 minutes.
+            This may indicate invalid metrics or memory pressure.
+
+

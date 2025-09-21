@@ -1,0 +1,11 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: platform-design
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://github.com/<your-org>/platform-design.git
+  ref:
+    branch: main
+

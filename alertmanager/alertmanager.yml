@@ -1,0 +1,9 @@
+route:
+  receiver: devnull
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 12h
+
+receivers:
+  - name: devnull
+
