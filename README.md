@@ -64,7 +64,8 @@ Notes
 
 ## TBD checklist (status)
 
-- [ ] App: add /readyz & /livez, graceful shutdown, JSON logs with trace ids
+- [x] App: add /readyz & /livez, graceful shutdown
+- [ ] App: add JSON logs with trace ids
 - [ ] Secrets: ESO+SOPS or Vault; DATABASE_URL via Secret (not plain env)
 - [ ] CI immutability: switch Helm values to digests; GitOps PR to flux repo; env approvals
 - [ ] Ingress/Gateway: HTTPS via cert-manager; smoke tests
@@ -136,6 +137,7 @@ docker compose up --build
 ```
 
 - App: `http://localhost:8080/` and metrics at `http://localhost:8080/metrics`
+- Health probes: readiness at `http://localhost:8080/readyz`, liveness at `http://localhost:8080/livez`
 - Prometheus UI: `http://localhost:9090/`
   - Check `Status -> Targets` to see `hello-world` as UP
   - Try queries like: `sum by (status) (rate(http_requests_total[5m]))`
@@ -219,6 +221,8 @@ helm upgrade --install hello-world ./hello-world/helm/hello-world   --namespace 
 
 ### Probes & Policies
 
-- Readiness: `GET /` on containerPort 8080
-- Liveness: `GET /metrics` (confirm the metrics endpoint is exposed)
+- Readiness: `GET /readyz` on containerPort 8080 (checks database connectivity when configured)
+- Liveness: `GET /livez` (always exposed, independent of feature flags)
 - Default-deny `NetworkPolicy` with explicit egress to Postgres and OTEL collector (adjust selectors to your environment).
+
+The Helm chart exposes probe paths via `values.yaml` under `healthProbes` so you can override them per environment if desired.

@@ -3,12 +3,13 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	migrate "github.com/golang-migrate/migrate/v4"
@@ -32,9 +33,42 @@ type appMetrics struct {
 }
 
 var (
-	metricsEnabled bool
-	mtr            *appMetrics
+	mtr *appMetrics
 )
+
+type dependencyChecker struct {
+	db *sql.DB
+}
+
+func (c dependencyChecker) pingDatabase(ctx context.Context) error {
+	if c.db == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := c.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("database ping: %w", err)
+	}
+	return nil
+}
+
+func (c dependencyChecker) readinessHandler(w http.ResponseWriter, r *http.Request) {
+	if err := c.pingDatabase(r.Context()); err != nil {
+		http.Error(w, fmt.Sprintf("not ready: %v", err), http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ready"))
+}
+
+func (c dependencyChecker) livenessHandler(w http.ResponseWriter, r *http.Request) {
+	if err := c.pingDatabase(r.Context()); err != nil {
+		http.Error(w, fmt.Sprintf("not live: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("alive"))
+}
 
 func enableMetrics() *appMetrics {
 	mc := prometheus.NewCounterVec(
@@ -139,10 +173,21 @@ func main() {
 	// Initialize OpenFeature (flagd) client for dynamic flags
 	initFeatureFlags(tracingDefault, metricsDefault)
 
-	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
-		if err := runMigrations(dbURL); err != nil {
-			log.Fatalf("migrations failed: %v", err)
+	var (
+		db    *sql.DB
+		err   error
+		dbURL = os.Getenv("DATABASE_URL")
+	)
+	if dbURL != "" {
+		db, err = setupDatabase(dbURL)
+		if err != nil {
+			log.Fatalf("database initialization failed: %v", err)
 		}
+		defer func() {
+			if cerr := db.Close(); cerr != nil {
+				log.Printf("database close error: %v", cerr)
+			}
+		}()
 	} else {
 		log.Printf("DATABASE_URL not set, skipping migrations")
 	}
@@ -164,8 +209,12 @@ func main() {
 	// Always register metrics collectors; recording/serving is gated dynamically
 	mtr = enableMetrics()
 
+	checker := dependencyChecker{db: db}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", helloHandler)
+	mux.HandleFunc("/readyz", checker.readinessHandler)
+	mux.HandleFunc("/livez", checker.livenessHandler)
 
 	// Metrics endpoint gated dynamically per-request
 	promHandler := promhttp.Handler()
@@ -189,31 +238,79 @@ func main() {
 	if p := os.Getenv("PORT"); p != "" {
 		addr = ":" + p
 	}
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
 	log.Printf("Starting hello-world on %s (feature flags via OpenFeature/flagd; admin=%v)", addr, adminFlagsEnabled)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("server failed: %v", err)
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			log.Fatalf("server failed: %v", err)
+		}
+	case sig := <-sigCh:
+		log.Printf("Received signal %s, initiating graceful shutdown", sig)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("server shutdown error: %v", err)
+		}
+		cancel()
+		<-serverErr
 	}
 }
 
-func runMigrations(databaseURL string) error {
-	var db *sql.DB
-	var err error
-	deadline := time.Now().Add(45 * time.Second)
+func setupDatabase(databaseURL string) (*sql.DB, error) {
+	db, err := waitForDatabase(databaseURL, 45*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if err := runMigrations(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func waitForDatabase(databaseURL string, timeout time.Duration) (*sql.DB, error) {
+	deadline := time.Now().Add(timeout)
 	for {
-		db, err = sql.Open("postgres", databaseURL)
-		if err == nil {
-			if pingErr := db.Ping(); pingErr == nil {
-				break
+		db, err := sql.Open("postgres", databaseURL)
+		if err != nil {
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("database open failed within deadline: %w", err)
 			}
-			db.Close()
+			time.Sleep(2 * time.Second)
+			continue
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		pingErr := db.PingContext(ctx)
+		cancel()
+		if pingErr == nil {
+			return db, nil
+		}
+		db.Close()
 		if time.Now().After(deadline) {
-			return fmt.Errorf("database not reachable within deadline: %w", err)
+			return nil, fmt.Errorf("database not reachable within deadline: %w", pingErr)
 		}
 		time.Sleep(2 * time.Second)
 	}
-	defer db.Close()
+}
 
+func runMigrations(db *sql.DB) error {
 	driver, err := postgres.WithInstance(db, &postgres.Config{})
 	if err != nil {
 		return fmt.Errorf("create driver: %w", err)
