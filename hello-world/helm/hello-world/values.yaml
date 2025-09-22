@@ -11,6 +11,10 @@ service:
 
 containerPort: 8080
 
+healthProbes:
+  readinessPath: /readyz
+  livenessPath: /livez
+
 resources:
   requests:
     cpu: "50m"
