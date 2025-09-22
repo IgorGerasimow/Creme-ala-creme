@@ -8,11 +8,11 @@ require (
     github.com/golang-migrate/migrate/v4 v4.17.0
     github.com/lib/pq v1.10.9
     github.com/prometheus/client_golang v1.17.0
-    go.opentelemetry.io/otel v1.27.0
-    go.opentelemetry.io/otel/sdk v1.27.0
-    go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.27.0
-    github.com/open-feature/go-sdk/openfeature v1.14.0
     github.com/open-feature/flagd-go-sdk v0.12.0
+    github.com/open-feature/go-sdk/openfeature v1.14.0
+    go.opentelemetry.io/otel v1.38.0
+    go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.38.0
+    go.opentelemetry.io/otel/sdk v1.38.0
 )
 
 require (

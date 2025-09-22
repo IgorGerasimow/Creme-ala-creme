@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	migrate "github.com/golang-migrate/migrate/v4"
@@ -147,18 +149,11 @@ func main() {
 		log.Printf("DATABASE_URL not set, skipping migrations")
 	}
 
-	// Tracer provider is created lazily on first enable; initialize now if desired
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	defer shutdownTracerProvider(context.Background())
 	if tracingDefault {
-		if shutdown, err := initTracer(ctx); err != nil {
-			log.Printf("tracing init failed, continuing without tracing: %v", err)
-		} else {
-			defer func() {
-				if err := shutdown(context.Background()); err != nil {
-					log.Printf("tracer shutdown error: %v", err)
-				}
-			}()
-		}
+		ensureTracerProvider(ctx)
 	}
 
 	// Always register metrics collectors; recording/serving is gated dynamically
@@ -189,9 +184,22 @@ func main() {
 	if p := os.Getenv("PORT"); p != "" {
 		addr = ":" + p
 	}
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+
+	go func() {
+		<-ctx.Done()
+		shutdownTracerProvider(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("server shutdown error: %v", err)
+		}
+	}()
+
 	log.Printf("Starting hello-world on %s (feature flags via OpenFeature/flagd; admin=%v)", addr, adminFlagsEnabled)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("server failed: %v", err)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("server failed: %v", err)
 	}
 }
 
