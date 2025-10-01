@@ -1,0 +1,67 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sessionbindings.cloudflare.example.com
+spec:
+  group: cloudflare.example.com
+  names:
+    kind: SessionBinding
+    listKind: SessionBindingList
+    plural: sessionbindings
+    singular: sessionbinding
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [sessionID, targetDeployment]
+              properties:
+                sessionID:
+                  type: string
+                userID:
+                  type: string
+                targetDeployment:
+                  type: string
+                ttlSeconds:
+                  type: integer
+                  format: int64
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                boundPod:
+                  type: string
+                routeEndpoint:
+                  type: string
+                observedGeneration:
+                  type: integer
+                  format: int64
+                lastReconcileTime:
+                  type: string
+                  format: date-time
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status, reason, message]
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+      subresources:
+        status: {}
