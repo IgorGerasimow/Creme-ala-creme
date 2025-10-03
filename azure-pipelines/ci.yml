@@ -1,0 +1,439 @@
+# Azure DevOps equivalent of the GitHub Actions CI/CD workflow.
+# Secrets such as AWS credentials and DB_MIGRATION_URL should be stored in a secure
+# variable group and linked to this pipeline rather than defined inline.
+# The pipeline expects to run on a self-hosted Linux agent with Docker and AWS/Kubernetes
+# CLIs available (matching the capabilities used by the GitHub workflow).
+
+trigger:
+  branches:
+    include:
+      - main
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - name: goVersion
+    value: '1.22'
+  - name: awsRegion
+    value: 'eu-central-1'
+  - name: ecrRepository
+    value: '<your-ecr-repo-name>'
+  - name: imageName
+    value: 'hello-world'
+  - name: promRulesNamespace
+    value: 'monitoring'
+  - name: promOperatorReleaseLabel
+    value: 'kube-prometheus-stack'
+  - name: selfHostedPool
+    value: 'Self-Hosted-Linux'
+
+stages:
+  - stage: BuildAndTest
+    displayName: Build, scan and test
+    jobs:
+      - job: Lint_Build_Test
+        displayName: Lint, scan, test and package
+        pool:
+          name: $(selfHostedPool)
+        variables:
+          workingDir: '$(System.DefaultWorkingDirectory)/hello-world'
+          gopath: '$(Pipeline.Workspace)/gopath'
+          gobin: '$(Pipeline.Workspace)/bin'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              set -euo pipefail
+              mkdir -p $(gobin)
+              echo "##vso[task.prependpath]$(gobin)"
+            displayName: Prepare Go tool cache
+
+          - task: GoTool@0
+            displayName: Install Go $(goVersion)
+            inputs:
+              version: '$(goVersion)'
+
+          - script: |
+              set -euo pipefail
+              curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | \
+                sh -s -- -b $(gobin) v1.55.0
+              golangci-lint run ./...
+            displayName: Run golangci-lint
+            workingDirectory: $(workingDir)
+            env:
+              GOPATH: $(gopath)
+              GOBIN: $(gobin)
+
+          - script: |
+              set -euo pipefail
+              go vet ./...
+            displayName: go vet
+            workingDirectory: $(workingDir)
+            env:
+              GOPATH: $(gopath)
+              GOBIN: $(gobin)
+
+          - script: |
+              set -euo pipefail
+              fmt_out=$(gofmt -s -l . || true)
+              if [ -n "$fmt_out" ]; then
+                echo "The following files are not formatted:" >&2
+                echo "$fmt_out" >&2
+                exit 1
+              fi
+            displayName: gofmt check
+            workingDirectory: $(workingDir)
+
+          - script: |
+              set -euo pipefail
+              go install github.com/securego/gosec/v2/cmd/gosec@latest
+            displayName: Install gosec
+            workingDirectory: $(workingDir)
+            env:
+              GOPATH: $(gopath)
+              GOBIN: $(gobin)
+
+          - script: |
+              set -euo pipefail
+              gosec ./...
+            displayName: Run gosec (SAST)
+            workingDirectory: $(workingDir)
+            env:
+              GOPATH: $(gopath)
+              GOBIN: $(gobin)
+
+          - script: |
+              set -euo pipefail
+              go install golang.org/x/vuln/cmd/govulncheck@latest
+            displayName: Install govulncheck
+            workingDirectory: $(workingDir)
+            env:
+              GOPATH: $(gopath)
+              GOBIN: $(gobin)
+
+          - script: |
+              set -euo pipefail
+              govulncheck ./...
+            displayName: Run govulncheck (SCA)
+            workingDirectory: $(workingDir)
+            env:
+              GOPATH: $(gopath)
+              GOBIN: $(gobin)
+
+          - script: |
+              set -euo pipefail
+              docker run --rm \
+                -v "$(workingDir)":/src \
+                aquasec/trivy:0.48.5 \
+                fs --exit-code 1 --severity CRITICAL,HIGH --format table /src
+            displayName: Trivy filesystem scan (CVE check for app code)
+
+          - script: |
+              set -euo pipefail
+              go test ./...
+            displayName: Run unit tests
+            workingDirectory: $(workingDir)
+            env:
+              GOPATH: $(gopath)
+              GOBIN: $(gobin)
+
+          - script: |
+              set -euo pipefail
+              docker build -t $(imageName):ci .
+            displayName: Build Docker image
+            workingDirectory: $(workingDir)
+
+          - script: |
+              set -euo pipefail
+              docker run --rm \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                aquasec/trivy:0.48.5 \
+                image --exit-code 1 --severity CRITICAL,HIGH --format table $(imageName):ci
+            displayName: Trivy scan (CVE check for image)
+
+          - script: |
+              set -euo pipefail
+              CONTAINER_NAME=hello-world-ci-test
+              docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+              trap 'docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true' EXIT
+              docker run -d --rm --name "$CONTAINER_NAME" -p 18080:8080 \
+                -e PORT=8080 -e ENABLE_METRICS=true $(imageName):ci
+              for i in $(seq 1 30); do
+                if curl -fsS http://127.0.0.1:18080/metrics >/dev/null; then
+                  break
+                fi
+                sleep 1
+              done
+              curl -fsS http://127.0.0.1:18080/ >/dev/null
+              curl -fsS http://127.0.0.1:18080/metrics | tee metrics.txt
+              grep -q 'http_requests_total{handler="/",method="GET",status="200"}' metrics.txt || {
+                echo 'Expected metric series not found in /metrics'
+                docker logs "$CONTAINER_NAME" || true
+                exit 1
+              }
+            displayName: Integration test - /metrics validation
+            workingDirectory: $(workingDir)
+
+          - script: |
+              set -euo pipefail
+              docker rm -f hello-ci >/dev/null 2>&1 || true
+              docker run -d --rm -p 8080:8080 --name hello-ci $(imageName):ci
+              for i in $(seq 1 30); do
+                if curl -fsS http://localhost:8080/ >/dev/null 2>&1; then
+                  echo "App is up"
+                  break
+                fi
+                sleep 1
+              done
+              curl -fsS http://localhost:8080/ || {
+                echo "App did not start" >&2
+                docker logs hello-ci
+                exit 1
+              }
+            displayName: Start container for DAST
+            workingDirectory: $(workingDir)
+
+          - script: |
+              set -euo pipefail
+              # OWASP ZAP baseline scan (non-blocking)
+              docker run --rm -t owasp/zap2docker-stable zap-baseline.py -t http://localhost:8080 -m 1 || true
+            displayName: OWASP ZAP Baseline (DAST)
+            workingDirectory: $(workingDir)
+
+          - script: |
+              set -euo pipefail
+              docker rm -f hello-ci || true
+            displayName: Stop DAST container
+            workingDirectory: $(workingDir)
+            condition: always()
+
+          - script: |
+              set -euo pipefail
+              if ! docker buildx inspect >/dev/null 2>&1; then
+                docker buildx create --use
+              fi
+              docker buildx inspect --bootstrap
+            displayName: Ensure Docker Buildx available
+
+          - script: |
+              set -euo pipefail
+              REF="$(Build.SourceBranch)"
+              if [[ "$REF" == refs/tags/release/* ]]; then
+                TAG="${REF#refs/tags/release/}"
+                echo "##vso[task.setvariable variable=IMAGE_TAG]$TAG"
+                echo "##vso[task.setvariable variable=PUSH_LATEST]true"
+              elif [[ "$REF" == refs/heads/main ]]; then
+                echo "##vso[task.setvariable variable=IMAGE_TAG]latest"
+                echo "##vso[task.setvariable variable=PUSH_LATEST]true"
+              else
+                echo "##vso[task.setvariable variable=IMAGE_TAG]sha-$(Build.SourceVersion)"
+                echo "##vso[task.setvariable variable=PUSH_LATEST]false"
+              fi
+            displayName: Determine image tag
+
+          - script: |
+              set -euo pipefail
+              echo "signed-by=example-cert" > image.signature
+              echo "##vso[task.setvariable variable=IMAGE_SIGNED]true"
+            displayName: Emulate image signing
+            workingDirectory: $(workingDir)
+
+          - script: |
+              set -euo pipefail
+              if [ ! -f image.signature ]; then
+                echo "Signature missing" >&2
+                exit 1
+              fi
+            displayName: Verify signature (gate push)
+            workingDirectory: $(workingDir)
+
+          - script: |
+              set -euo pipefail
+              aws ecr get-login-password --region $(awsRegion) | \
+                docker login --username AWS --password-stdin $(aws sts get-caller-identity --query 'Account' --output text).dkr.ecr.$(awsRegion).amazonaws.com
+            displayName: ECR login
+            condition: and(
+              succeeded(),
+              eq(variables['IMAGE_SIGNED'], 'true'),
+              or(
+                eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+                startsWith(variables['Build.SourceBranch'], 'refs/tags/release/')
+              )
+            )
+
+          - script: |
+              set -euo pipefail
+              AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+              echo "##vso[task.setvariable variable=ECR_REGISTRY]${AWS_ACCOUNT_ID}.dkr.ecr.$(awsRegion).amazonaws.com"
+            displayName: Set ECR registry variable
+            condition: and(
+              succeeded(),
+              eq(variables['IMAGE_SIGNED'], 'true'),
+              or(
+                eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+                startsWith(variables['Build.SourceBranch'], 'refs/tags/release/')
+              )
+            )
+
+          - script: |
+              set -euo pipefail
+              docker tag $(imageName):ci $(ECR_REGISTRY)/$(ecrRepository):$(IMAGE_TAG)
+              docker tag $(imageName):ci $(ECR_REGISTRY)/$(ecrRepository):sha-$(Build.SourceVersion)
+              if [ "$(PUSH_LATEST)" = "true" ]; then
+                docker tag $(imageName):ci $(ECR_REGISTRY)/$(ecrRepository):latest
+              fi
+              docker push $(ECR_REGISTRY)/$(ecrRepository):$(IMAGE_TAG)
+              docker push $(ECR_REGISTRY)/$(ecrRepository):sha-$(Build.SourceVersion)
+              if [ "$(PUSH_LATEST)" = "true" ]; then
+                docker push $(ECR_REGISTRY)/$(ecrRepository):latest
+              fi
+            displayName: Tag and push Docker image
+            condition: and(
+              succeeded(),
+              eq(variables['IMAGE_SIGNED'], 'true'),
+              or(
+                eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+                startsWith(variables['Build.SourceBranch'], 'refs/tags/release/')
+              )
+            )
+
+          - script: |
+              set -euo pipefail
+              if [ -z "$(DB_MIGRATION_URL)" ]; then
+                echo "DB_MIGRATION_URL not set, skipping migrations"
+                exit 0
+              fi
+              if [ ! -d hello-world/migrations ]; then
+                echo "migrations dir not found" >&2
+                exit 1
+              fi
+              docker run --rm \
+                -v "$(System.DefaultWorkingDirectory)/hello-world/migrations":/migrations:ro \
+                -e DATABASE_URL="$(DB_MIGRATION_URL)" \
+                migrate/migrate:v4.17.0 \
+                -path=/migrations -database "$(DB_MIGRATION_URL)" up
+            displayName: Run DB migrations (prod)
+            condition: and(
+              succeeded(),
+              ne(variables['DB_MIGRATION_URL'], ''),
+              or(
+                eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+                startsWith(variables['Build.SourceBranch'], 'refs/tags/release/')
+              )
+            )
+            workingDirectory: $(System.DefaultWorkingDirectory)
+
+          - script: |
+              set -euo pipefail
+              docker run --rm \
+                -v "$(System.DefaultWorkingDirectory)/hello-world/monitoring":/rules:ro \
+                prom/prometheus:latest \
+                promtool check rules /rules/prometheus-rules.yaml
+            displayName: Validate alerting rules with promtool
+            condition: or(
+              eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+              startsWith(variables['Build.SourceBranch'], 'refs/tags/release/')
+            )
+
+          - task: KubectlInstaller@0
+            displayName: Install kubectl 1.29.4
+            inputs:
+              kubectlVersion: 'v1.29.4'
+            condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+
+  - stage: PRImagePush
+    displayName: Push PR image to ECR
+    dependsOn: BuildAndTest
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: Push_PR_Image
+        displayName: Push PR image
+        pool:
+          name: $(selfHostedPool)
+        variables:
+          workingDir: '$(System.DefaultWorkingDirectory)/hello-world'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              set -euo pipefail
+              docker build -t $(imageName):pr-$(System.PullRequest.PullRequestId) .
+            displayName: Build PR Docker image
+            workingDirectory: $(workingDir)
+
+          - script: |
+              set -euo pipefail
+              echo "signed-by=example-cert" > image.signature
+              echo "##vso[task.setvariable variable=IMAGE_SIGNED]true"
+            displayName: Emulate image signing (PR)
+            workingDirectory: $(workingDir)
+
+          - script: |
+              set -euo pipefail
+              test -f image.signature
+            displayName: Verify signature (gate push)
+            workingDirectory: $(workingDir)
+
+          - script: |
+              set -euo pipefail
+              aws ecr get-login-password --region $(awsRegion) | \
+                docker login --username AWS --password-stdin $(aws sts get-caller-identity --query 'Account' --output text).dkr.ecr.$(awsRegion).amazonaws.com
+            displayName: ECR login (PR)
+
+          - script: |
+              set -euo pipefail
+              AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+              echo "##vso[task.setvariable variable=ECR_REGISTRY]${AWS_ACCOUNT_ID}.dkr.ecr.$(awsRegion).amazonaws.com"
+            displayName: Set ECR registry variable (PR)
+
+          - script: |
+              set -euo pipefail
+              docker tag $(imageName):pr-$(System.PullRequest.PullRequestId) $(ECR_REGISTRY)/$(ecrRepository):pr-$(System.PullRequest.PullRequestId)
+              docker push $(ECR_REGISTRY)/$(ecrRepository):pr-$(System.PullRequest.PullRequestId)
+            displayName: Push PR image
+
+  - stage: Deploy
+    displayName: Apply Kubernetes manifests
+    dependsOn: BuildAndTest
+    condition: and(
+      succeeded(),
+      eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+      ne(variables['Build.Reason'], 'PullRequest')
+    )
+    jobs:
+      - job: Deploy
+        displayName: Apply Flux manifests
+        pool:
+          name: $(selfHostedPool)
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: KubectlInstaller@0
+            displayName: Install kubectl 1.29.4
+            inputs:
+              kubectlVersion: 'v1.29.4'
+
+          - script: |
+              set -euo pipefail
+              if ! command -v kubectl >/dev/null 2>&1; then
+                echo "kubectl not found, skipping deploy"
+                exit 0
+              fi
+              if ! kubectl cluster-info >/dev/null 2>&1; then
+                echo "No cluster access from agent, skipping deploy"
+                exit 0
+              fi
+              if [ -f hello-world/deploy/flux/platform-design-gitrepository.yaml ]; then
+                kubectl apply -f hello-world/deploy/flux/platform-design-gitrepository.yaml
+              fi
+              if [ -f hello-world/deploy/flux/hello-world-helmrelease.yaml ]; then
+                kubectl apply -f hello-world/deploy/flux/hello-world-helmrelease.yaml
+              fi
+              echo "Deploy step complete"
+            displayName: Apply Kubernetes manifests
+            workingDirectory: $(System.DefaultWorkingDirectory)
