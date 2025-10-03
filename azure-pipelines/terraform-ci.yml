@@ -1,0 +1,62 @@
+# Azure DevOps pipeline that mirrors the Terraform CI GitHub workflow.
+# It formats and validates Terraform modules touched by changes under the terraform/ directory.
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/*
+      - terraform/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/*
+      - terraform/**
+
+stages:
+  - stage: TerraformFmtValidate
+    displayName: Terraform fmt & validate
+    jobs:
+      - job: fmt_validate
+        displayName: fmt & validate
+        timeoutInMinutes: 15
+        pool:
+          vmImage: ubuntu-latest
+        variables:
+          TF_IN_AUTOMATION: 'true'
+        strategy:
+          matrix:
+            cloudflare_session_operator:
+              workingDir: terraform/configurations/cloudflare-session-operator
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform 1.6.6
+            inputs:
+              terraformVersion: '1.6.6'
+
+          - script: terraform fmt -check -recursive
+            displayName: Terraform fmt (check)
+            workingDirectory: $(System.DefaultWorkingDirectory)/$(workingDir)
+            env:
+              TF_IN_AUTOMATION: $(TF_IN_AUTOMATION)
+
+          - script: terraform init -backend=false
+            displayName: Terraform init (no backend)
+            workingDirectory: $(System.DefaultWorkingDirectory)/$(workingDir)
+            env:
+              TF_IN_AUTOMATION: $(TF_IN_AUTOMATION)
+
+          - script: terraform validate -no-color
+            displayName: Terraform validate
+            workingDirectory: $(System.DefaultWorkingDirectory)/$(workingDir)
+            env:
+              TF_IN_AUTOMATION: $(TF_IN_AUTOMATION)
