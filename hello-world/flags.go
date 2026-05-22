@@ -10,9 +10,8 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"time"
 
-	flagd "github.com/open-feature/flagd-go-sdk/pkg/provider"
+	flagd "github.com/open-feature/go-sdk-contrib/providers/flagd/pkg"
 	"github.com/open-feature/go-sdk/openfeature"
 )
 
@@ -25,7 +24,7 @@ type flagOverrides struct {
 }
 
 var (
-	ofClient              openfeature.Client
+	ofClient              *openfeature.Client
 	defaultTracing        atomic.Bool
 	defaultMetrics        atomic.Bool
 	overridesValue        atomic.Value // stores flagOverrides
@@ -36,23 +35,50 @@ var (
 	tracerShutdownFn  func(context.Context) error
 )
 
+// init ensures overridesValue holds a zero flagOverrides and ofClient is
+// non-nil before any code that might call them executes. Without this, a
+// flag evaluation from a test that hasn't called initFeatureFlags() would
+// panic on the atomic.Value type assertion or nil dereference.
+func init() {
+	overridesValue.Store(flagOverrides{})
+	_ = openfeature.SetProvider(openfeature.NoopProvider{})
+	ofClient = openfeature.NewClient("hello-world")
+}
+
 func initFeatureFlags(tracingDefault, metricsDefault bool) {
 	// Set defaults
 	defaultTracing.Store(tracingDefault)
 	defaultMetrics.Store(metricsDefault)
 	overridesValue.Store(flagOverrides{})
 
-	// Initialize flagd provider if available, else noop
-	host := getenvDefault("FLAGD_HOST", "flagd")
-	port := getenvDefault("FLAGD_PORT", "8013")
+	// Only initialize the flagd remote provider when the operator has
+	// explicitly opted in via FLAGD_HOST. Otherwise stay on the SDK's
+	// built-in NoopProvider; this keeps tests and bare-metal runs from
+	// spawning a background event-stream connection that we then need to
+	// shut down safely (the openfeature SDK has had data races in
+	// provider-swap on Shutdown — explicit opt-in avoids them entirely).
+	host := os.Getenv("FLAGD_HOST")
+	if host == "" {
+		_ = openfeature.SetProvider(openfeature.NoopProvider{})
+		ofClient = openfeature.NewClient("hello-world")
+		return
+	}
+	portStr := getenvDefault("FLAGD_PORT", "8013")
+
+	portU, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		log.Printf("flagd: invalid FLAGD_PORT %q, falling back to NoopProvider: %v", portStr, err)
+		_ = openfeature.SetProvider(openfeature.NoopProvider{})
+		ofClient = openfeature.NewClient("hello-world")
+		return
+	}
 
 	provider := flagd.NewProvider(
 		flagd.WithHost(host),
-		flagd.WithPort(port),
-		flagd.WithMaxEventStreamRetries(3),
-		flagd.WithMaxProviderReadyWait(time.Second*3),
+		flagd.WithPort(uint16(portU)),
+		flagd.WithEventStreamConnectionMaxAttempts(3),
 	)
-	openfeature.SetProvider(provider)
+	_ = openfeature.SetProvider(provider)
 	ofClient = openfeature.NewClient("hello-world")
 }
 
@@ -218,7 +244,7 @@ func ensureTracerProvider(ctx context.Context) {
 
 	shutdown, err := tracerProviderFactory(ctx)
 	if err != nil {
-		logger.Warn().Err(err).Msg("tracing init failed, continuing without tracing")
+		logger.Warn().Str("error", safeErr(err)).Msg("tracing init failed, continuing without tracing")
 		return
 	}
 	tracerShutdownFn = shutdown
@@ -235,7 +261,7 @@ func shutdownTracerProvider(ctx context.Context) {
 
 	if shutdown != nil {
 		if err := shutdown(ctx); err != nil {
-			logger.Error().Err(err).Msg("tracer shutdown error")
+			logger.Error().Str("error", safeErr(err)).Msg("tracer shutdown error")
 		}
 	}
 }
