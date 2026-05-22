@@ -1,0 +1,124 @@
+# Local validation overrides for kind cluster.
+# Apply with: helm install hello-world ./hello-world/helm/hello-world -n hello-world -f values-local.yaml
+#
+# Prerequisites in the cluster (applied separately, see hello-world/deploy/local/):
+#   - cert-manager ClusterIssuer 'selfsigned-ca-issuer'
+#   - external-secrets ClusterSecretStore 'fake-local-store'
+#   - Postgres StatefulSet + Service in 'hello-world' namespace
+
+replicaCount: 1
+
+# Local smoke uses traefik/whoami as a stand-in for the real hello-world binary.
+# The real hello-world image lives behind Phase A's go.mod fix (PR #24); the
+# point of this local validation is to prove the chart's TLS/RBAC/ESO/PSS
+# behaviour, not to exercise the Go service. Whoami:
+#   - speaks HTTP on $PORT (we pass --port 8080)
+#   - returns 200 on every path -> satisfies /readyz and /livez probes
+#   - dumps request + env on GET, useful for verifying envFromSecret
+image:
+  repository: traefik/whoami
+  tag: "latest"
+  # IfNotPresent — kind node will pull from Docker Hub on first need.
+  pullPolicy: IfNotPresent
+
+# Command override so whoami listens where the chart expects.
+command:
+  - /whoami
+  - --port
+  - "8080"
+
+namespace:
+  create: true
+  pss:
+    enforce: restricted
+    audit: restricted
+    warn: restricted
+
+# HPA off for local — single replica is fine.
+hpa:
+  enabled: false
+
+# PDB requires >= 2 replicas to be meaningful; disable for local.
+pdb:
+  enabled: false
+
+# Prometheus operator CRDs are NOT installed in the local kind cluster.
+serviceMonitor:
+  enabled: false
+
+# Migrations disabled for local — Postgres is a fresh empty DB,
+# and there are no actual SQL files committed to the chart.
+migrations:
+  enabled: false
+
+# Tighter resource ceilings for the local single-node cluster.
+resourceQuota:
+  enabled: true
+  requestsCpu: "1"
+  requestsMemory: "512Mi"
+  limitsCpu: "2"
+  limitsMemory: "1Gi"
+  pods: "10"
+  secrets: "20"
+  configmaps: "20"
+
+ingress:
+  enabled: true
+  className: "nginx"
+  host: "hello-world.local"
+  path: "/"
+  pathType: Prefix
+
+certificate:
+  enabled: true
+  issuerRef:
+    name: "selfsigned-ca-issuer"
+    kind: "ClusterIssuer"
+    group: "cert-manager.io"
+  duration: "2160h"
+  renewBefore: "360h"
+  algorithm: ECDSA
+  size: 256
+
+externalSecret:
+  enabled: true
+  secretStoreRef:
+    name: "fake-local-store"
+    kind: "ClusterSecretStore"
+  refreshInterval: "1m"
+  data:
+    - secretKey: DATABASE_URL
+      remoteRef:
+        key: hello-world/database/DATABASE_URL
+        version: v1
+
+envFromSecret:
+  enabled: true
+  secretName: ""   # defaults to '<release>-db' materialized by the ExternalSecret
+  keys:
+    - DATABASE_URL
+
+# Production-side defaults are mostly fine; override flagd/otel to localhost-friendly
+# noops for the local cluster.
+env:
+  - name: PORT
+    value: "8080"
+  - name: LOG_LEVEL
+    value: "info"
+  - name: LOG_FORMAT
+    value: "json"
+  - name: ENVIRONMENT
+    value: "local"
+  - name: SKIP_MIGRATIONS
+    value: "true"
+  - name: ENABLE_METRICS
+    value: "true"
+  - name: ENABLE_TRACING
+    value: "false"
+  - name: ADMIN_FLAGS_ENABLED
+    value: "false"
+  - name: OTEL_SERVICE_NAME
+    value: "hello-world"
+
+# Postgres in local cluster is reached via label-selector egress (chart default
+# already allows pods labeled app=postgres on :5432).

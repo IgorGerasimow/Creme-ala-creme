@@ -35,3 +35,29 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- default "default" .Values.serviceAccount.name -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Pre-render validation: if ADMIN_FLAGS_ENABLED=true is set anywhere in .Values.env,
+ADMIN_API_KEY MUST also be defined (either in env or envFromSecret keys).
+Refuses to render the deployment otherwise.
+*/}}
+{{- define "hello-world.assertAdminGuard" -}}
+{{- $adminEnabled := false -}}
+{{- $adminKeyPresent := false -}}
+{{- range .Values.env }}
+  {{- if and (eq .name "ADMIN_FLAGS_ENABLED") (eq (toString .value) "true") -}}
+    {{- $adminEnabled = true -}}
+  {{- end -}}
+  {{- if eq .name "ADMIN_API_KEY" -}}
+    {{- $adminKeyPresent = true -}}
+  {{- end -}}
+{{- end -}}
+{{- range .Values.envFromSecret.keys | default list -}}
+  {{- if eq . "ADMIN_API_KEY" -}}
+    {{- $adminKeyPresent = true -}}
+  {{- end -}}
+{{- end -}}
+{{- if and $adminEnabled (not $adminKeyPresent) -}}
+{{- fail "ADMIN_FLAGS_ENABLED=true requires ADMIN_API_KEY to be provided (set via envFromSecret.keys or env)" -}}
+{{- end -}}
+{{- end -}}

@@ -1,3 +1,4 @@
+{{- include "hello-world.assertAdminGuard" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,19 +15,45 @@ spec:
       labels:
         {{- include "hello-world.selectorLabels" . | nindent 8 }}
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        # Roll the Deployment when the env block changes so secret-ref aliases
+        # are picked up without a manual restart.
+        checksum/env: {{ toYaml .Values.env | sha256sum }}
+        checksum/envFromSecret: {{ toYaml .Values.envFromSecret | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       automountServiceAccountToken: false
       serviceAccountName: {{ include "hello-world.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: app
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.containerPort }}
           env:
             {{- toYaml .Values.env | nindent 12 }}
+          {{- if .Values.envFromSecret.enabled }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.envFromSecret.secretName | default (printf "%s-db" (include "hello-world.fullname" .)) }}
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:

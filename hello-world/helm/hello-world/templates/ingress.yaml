@@ -1,0 +1,50 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "hello-world.fullname" . }}
+  labels:
+    {{- include "hello-world.labels" . | nindent 4 }}
+  annotations:
+    # TLS enforcement: redirect all HTTP -> HTTPS at the ingress layer
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # HSTS: 1 year, include subdomains, allow preload
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
+    # Conservative body / proxy limits
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    # Note on hardening headers (X-Frame-Options, X-Content-Type-Options, Referrer-Policy,
+    # Content-Security-Policy): ingress-nginx blocks configuration-snippet by default since
+    # v1.9 (CVE-2023-5043/5044). Apply these headers via the cluster-wide
+    # ingress-nginx ConfigMap (controller.config.add-headers) in platform-design, or set
+    # the app to emit them in its own response middleware.
+    # NOTE: do NOT set cert-manager.io/cluster-issuer here when the chart's own
+    # Certificate template is enabled — ingress-shim would auto-create a second
+    # Certificate and fight ours over .spec.usages. Our explicit Certificate
+    # already manages the TLS secret referenced below.
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ include "hello-world.fullname" . }}-tls
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path | default "/" | quote }}
+            pathType: {{ .Values.ingress.pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ include "hello-world.fullname" . }}
+                port:
+                  number: {{ .Values.service.port }}
+{{- end }}
