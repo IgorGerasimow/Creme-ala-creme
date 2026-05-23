@@ -133,11 +133,13 @@ func TestSecurityHeaders_AllSet(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 
 	want := map[string]string{
-		"X-Content-Type-Options":  "nosniff",
-		"X-Frame-Options":         "DENY",
-		"Content-Security-Policy": "default-src 'none'",
-		"Referrer-Policy":         "no-referrer",
-		"Permissions-Policy":      "geolocation=(), microphone=(), camera=()",
+		"X-Content-Type-Options":       "nosniff",
+		"X-Frame-Options":              "DENY",
+		"Content-Security-Policy":      "default-src 'none'",
+		"Referrer-Policy":              "no-referrer",
+		"Permissions-Policy":           "geolocation=(), microphone=(), camera=()",
+		"Cross-Origin-Resource-Policy": "same-origin",
+		"Cache-Control":                "no-store",
 	}
 	for k, v := range want {
 		if got := rr.Header().Get(k); got != v {
