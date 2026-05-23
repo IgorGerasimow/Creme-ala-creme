@@ -5,6 +5,14 @@ replicaCount: 2
 
 image:
   repository: ghcr.io/your-org/hello-world
+  # Image reference precedence (highest to lowest):
+  #   1. image.digest — sha256 digest, e.g. "sha256:abc123..." (immutable, recommended for prod)
+  #   2. image.tag    — mutable tag, e.g. "v1.2.3" or "sha-<gitsha>"
+  # When image.digest is set (non-empty), the Deployment renders
+  # `repository@digest` and ignores image.tag entirely. CI publishes the
+  # digest after `docker push`; GitOps PRs update image.digest in the
+  # downstream HelmRelease.
+  digest: ""
   tag: "latest"
   pullPolicy: IfNotPresent
 
