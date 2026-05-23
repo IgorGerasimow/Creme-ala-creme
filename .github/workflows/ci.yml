@@ -144,6 +144,9 @@ jobs:
           # action treats WARN-NEW>0 as failure when fail_action=true.
           # Real HIGH/CRITICAL findings still fail via FAIL-NEW count.
           fail_action: false
+          # The workflow does not grant `issues: write`; suppress the
+          # action's attempt to file a GitHub issue per scan.
+          allow_issue_writing: false
 
       - name: Stop DAST container
         if: always()
