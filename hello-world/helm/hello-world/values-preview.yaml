@@ -1,0 +1,109 @@
+# Ephemeral PR preview overlay.
+# Applied with:
+#   helm upgrade --install hello-world-pr-N ./hello-world/helm/hello-world \
+#     --namespace pr-N --create-namespace \
+#     -f hello-world/helm/hello-world/values-preview.yaml \
+#     --set ingress.host=pr-N.hello-world.local \
+#     --set image.repository=<repo> \
+#     --set image.tag=pr-N
+#
+# Designed to be cheap and self-contained: single replica, no HPA, no
+# PDB, no Prometheus ServiceMonitor, self-signed cert via the same
+# selfsigned-ca-issuer used by local validation, ESO Fake store. The
+# PR-preview workflow tears the whole namespace down when the PR closes.
+
+replicaCount: 1
+
+# image.repository and image.tag are set per-PR via --set on the CLI.
+image:
+  pullPolicy: IfNotPresent
+
+namespace:
+  create: true
+  pss:
+    enforce: restricted
+    audit: restricted
+    warn: restricted
+
+hpa:
+  enabled: false
+
+pdb:
+  enabled: false
+
+# Preview clusters typically run without the Prometheus operator.
+serviceMonitor:
+  enabled: false
+
+# No real migrations in previews — Postgres is ephemeral / shared.
+migrations:
+  enabled: false
+
+# Tighter quotas for preview namespaces so an unbounded number of PR
+# previews can coexist without exhausting cluster capacity.
+resourceQuota:
+  enabled: true
+  requestsCpu: "500m"
+  requestsMemory: "256Mi"
+  limitsCpu: "1"
+  limitsMemory: "512Mi"
+  pods: "5"
+  secrets: "10"
+  configmaps: "10"
+
+ingress:
+  enabled: true
+  className: "nginx"
+  # host overridden per PR via --set ingress.host=pr-<N>.hello-world.local
+  host: "pr-preview.hello-world.local"
+  path: "/"
+  pathType: Prefix
+
+certificate:
+  enabled: true
+  issuerRef:
+    name: "selfsigned-ca-issuer"
+    kind: "ClusterIssuer"
+    group: "cert-manager.io"
+  duration: "168h"      # 7 days — preview env lifetime
+  renewBefore: "24h"
+  algorithm: ECDSA
+  size: 256
+
+externalSecret:
+  enabled: true
+  secretStoreRef:
+    name: "fake-local-store"
+    kind: "ClusterSecretStore"
+  refreshInterval: "5m"
+  data:
+    - secretKey: DATABASE_URL
+      remoteRef:
+        key: hello-world/database/DATABASE_URL
+        version: v1
+
+envFromSecret:
+  enabled: true
+  secretName: ""
+  keys:
+    - DATABASE_URL
+
+env:
+  - name: PORT
+    value: "8080"
+  - name: LOG_LEVEL
+    value: "debug"
+  - name: LOG_FORMAT
+    value: "json"
+  - name: ENVIRONMENT
+    value: "preview"
+  - name: SKIP_MIGRATIONS
+    value: "true"
+  - name: ENABLE_METRICS
+    value: "true"
+  - name: ENABLE_TRACING
+    value: "false"
+  - name: ADMIN_FLAGS_ENABLED
+    value: "false"
+  - name: OTEL_SERVICE_NAME
+    value: "hello-world-preview"
