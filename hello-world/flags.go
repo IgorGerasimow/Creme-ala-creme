@@ -73,11 +73,17 @@ func initFeatureFlags(tracingDefault, metricsDefault bool) {
 		return
 	}
 
-	provider := flagd.NewProvider(
+	provider, err := flagd.NewProvider(
 		flagd.WithHost(host),
 		flagd.WithPort(uint16(portU)),
 		flagd.WithEventStreamConnectionMaxAttempts(3),
 	)
+	if err != nil {
+		log.Printf("flagd: NewProvider failed, falling back to NoopProvider: %v", err)
+		_ = openfeature.SetProvider(openfeature.NoopProvider{})
+		ofClient = openfeature.NewClient("hello-world")
+		return
+	}
 	_ = openfeature.SetProvider(provider)
 	ofClient = openfeature.NewClient("hello-world")
 }
