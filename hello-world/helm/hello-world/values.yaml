@@ -1,3 +1,6 @@
+# hello-world Helm chart — production defaults.
+# Local validation overrides live in values-local.yaml.
+
 replicaCount: 2
 
 image:
@@ -10,6 +13,11 @@ service:
   port: 80
 
 containerPort: 8080
+
+# Optional container command / args override. Leave empty to use the image's
+# default entrypoint.
+command: []
+args: []
 
 healthProbes:
   readinessPath: /readyz
@@ -25,26 +33,62 @@ resources:
 
 podAnnotations: {}
 
+# Namespace creation (off by default — assume operator pre-creates).
+# When enabled, applies Pod Security Standards 'restricted' labels.
+namespace:
+  create: false
+  pss:
+    enforce: restricted
+    enforceVersion: latest
+    audit: restricted
+    warn: restricted
+
 serviceAccount:
   create: true
   name: ""
 
+# RBAC: principle of least privilege.
+# Default: NO Role rules — the app does not call the Kubernetes API.
+# To grant API access, set rbac.create=true and define rbac.rules explicitly.
+rbac:
+  create: false
+  rules: []
+
+# Container-level securityContext. Pod-level is set in the deployment template.
 securityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
+  privileged: false
   capabilities:
     drop: ["ALL"]
   seccompProfile:
     type: RuntimeDefault
 
+# Ingress (TLS-only). When enabled, requires certificate.enabled and a working ingress controller.
 ingress:
   enabled: false
-  className: ""
-  hosts: []
-  tls: []
+  className: "nginx"
+  host: "hello-world.local"
+  path: "/"
+  pathType: Prefix
+  annotations: {}
+
+# cert-manager Certificate. When enabled, materializes a TLS secret consumed by the Ingress.
+certificate:
+  enabled: false
+  # ClusterIssuer (or Issuer) reference. Production uses 'letsencrypt-prod' or similar.
+  issuerRef:
+    name: "letsencrypt-prod"
+    kind: "ClusterIssuer"
+    group: "cert-manager.io"
+  duration: "2160h"   # 90 days
+  renewBefore: "360h" # 15 days
+  algorithm: ECDSA
+  size: 256
+  extraDnsNames: []
 
 hpa:
   enabled: true
@@ -78,6 +122,14 @@ networkPolicy:
       ports:
         - port: 8080
           protocol: TCP
+    # Allow ingress-nginx to reach the pod (kind cluster path)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8080
+          protocol: TCP
   allowEgress:
     # DNS resolution (kube-dns)
     - to:
@@ -89,9 +141,11 @@ networkPolicy:
           protocol: UDP
         - port: 53
           protocol: TCP
-    # Database access
+    # Database access (label-based). Allows any pod labeled app=postgres in
+    # any namespace that ships the kubernetes.io/metadata.name label.
     - to:
-        - podSelector:
+        - namespaceSelector: {}
+          podSelector:
             matchLabels:
               app: postgres
       ports:
@@ -108,6 +162,14 @@ networkPolicy:
         - port: 4318
           protocol: TCP
 
+# Static, non-secret env vars only.
+# DATABASE_URL and other secrets are projected via envFromSecret below (not here).
+# Phase A carry-forward:
+#   - FLAGD_HOST is intentionally NOT set by default — flagd is opt-in per Phase A.
+#     Set FLAGD_HOST explicitly (env value) when running with an OpenFeature/flagd backend.
+#   - ENABLE_TRACING / ADMIN_FLAGS_ENABLED default to "false" here.
+#   - If ADMIN_FLAGS_ENABLED is set to "true", ADMIN_API_KEY must be provided
+#     (either in env or via envFromSecret.keys) or the deployment will refuse to render.
 env:
   - name: PORT
     value: "8080"
@@ -117,29 +179,16 @@ env:
     value: "json"
   - name: ENVIRONMENT
     value: "production"
-  # SKIP_MIGRATIONS should be true in production (migrations run via Job)
+  # Skip startup migrations; they run via a separate Helm pre-install Job.
   - name: SKIP_MIGRATIONS
     value: "true"
-  # DATABASE_URL is supplied via Secret (created by ExternalSecret or manually)
-  - name: DATABASE_URL
-    valueFrom:
-      secretKeyRef:
-        name: hello-world-db
-        key: url
-  # Feature flags - controlled via OpenFeature/flagd in production
   - name: ENABLE_METRICS
     value: "true"
   - name: ENABLE_TRACING
-    value: "true"
-  # Admin endpoints should be disabled in production
+    value: "false"
   - name: ADMIN_FLAGS_ENABLED
     value: "false"
-  # OpenFeature / flagd
-  - name: FLAGD_HOST
-    value: "flagd"
-  - name: FLAGD_PORT
-    value: "8013"
-  # OpenTelemetry
+  # OpenTelemetry — only active when ENABLE_TRACING=true on the running process.
   - name: OTEL_EXPORTER_OTLP_ENDPOINT
     value: "http://otel-collector:4318"
   - name: OTEL_TRACES_EXPORTER
@@ -147,24 +196,39 @@ env:
   - name: OTEL_SERVICE_NAME
     value: "hello-world"
 
-# Database migrations configuration
+# Project secret keys (e.g., DATABASE_URL, ADMIN_API_KEY) into the container
+# via `envFrom: - secretRef: ...`. The referenced Secret is created either by the
+# ExternalSecret below or manually out-of-band. NEVER set DATABASE_URL in plain env.
+envFromSecret:
+  enabled: true
+  # Default: the Secret materialized by the ExternalSecret named '<release>-db'.
+  secretName: ""
+  # Keys this Secret is expected to provide. Used only by the
+  # 'assertAdminGuard' helper to verify ADMIN_API_KEY presence when admin flags are on.
+  keys:
+    - DATABASE_URL
+
 migrations:
   enabled: true
-  # Secret containing DATABASE_URL for migrations
-  # This secret is created by externalSecret or manually
   secretName: "hello-world-db"
-  secretKey: "url"
+  secretKey: "DATABASE_URL"
 
-# External Secrets Operator integration
-# Enables automatic secret synchronization from AWS Secrets Manager, Vault, etc.
+# External Secrets Operator integration.
+# Production: backed by AWS Secrets Manager / Vault via a real SecretStore.
+# Local: see values-local.yaml — uses the ESO 'Fake' generator.
 externalSecret:
   enabled: false
   secretStoreRef:
     name: "aws-secretsmanager"
     kind: "SecretStore"
-  # Path in secret store (e.g., AWS Secrets Manager ARN or path)
-  secretPath: "hello-world/database"
   refreshInterval: "1h"
+  # ONE of the following must be set (data takes precedence over dataFrom):
+  #   data:        explicit key-by-key mapping (works with Fake / static stores)
+  #   dataFrom:    list of dataFrom entries (extract / find — for AWS/Vault dumps)
+  #   secretPath:  shorthand for `dataFrom: [{ extract: { key: <secretPath> } }]`
+  data: []
+  dataFrom: []
+  secretPath: ""
 
 resourceQuota:
   enabled: true
@@ -173,3 +237,5 @@ resourceQuota:
   limitsCpu: "8"
   limitsMemory: "8Gi"
   pods: "20"
+  secrets: "20"
+  configmaps: "20"

@@ -1,0 +1,14 @@
+{{- if .Values.namespace.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    {{- include "hello-world.labels" . | nindent 4 }}
+    # Pod Security Standards: enforce 'restricted' baseline at the namespace.
+    # See https://kubernetes.io/docs/concepts/security/pod-security-standards/
+    pod-security.kubernetes.io/enforce: {{ .Values.namespace.pss.enforce | default "restricted" | quote }}
+    pod-security.kubernetes.io/enforce-version: {{ .Values.namespace.pss.enforceVersion | default "latest" | quote }}
+    pod-security.kubernetes.io/audit: {{ .Values.namespace.pss.audit | default "restricted" | quote }}
+    pod-security.kubernetes.io/warn: {{ .Values.namespace.pss.warn | default "restricted" | quote }}
+{{- end }}

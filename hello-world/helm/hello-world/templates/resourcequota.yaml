@@ -12,6 +12,12 @@ spec:
     limits.cpu: {{ .Values.resourceQuota.limitsCpu | quote }}
     limits.memory: {{ .Values.resourceQuota.limitsMemory | quote }}
     pods: {{ .Values.resourceQuota.pods | quote }}
+    {{- if .Values.resourceQuota.secrets }}
+    secrets: {{ .Values.resourceQuota.secrets | quote }}
+    {{- end }}
+    {{- if .Values.resourceQuota.configmaps }}
+    configmaps: {{ .Values.resourceQuota.configmaps | quote }}
+    {{- end }}
 ---
 apiVersion: v1
 kind: LimitRange
@@ -31,4 +37,7 @@ spec:
       max:
         cpu: "2"
         memory: "1Gi"
+      min:
+        cpu: "10m"
+        memory: "16Mi"
 {{- end }}

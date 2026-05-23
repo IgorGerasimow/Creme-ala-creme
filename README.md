@@ -66,11 +66,11 @@ Notes
 
 - [x] App: add /readyz & /livez, graceful shutdown
 - [x] App: add JSON logs with trace ids
-- [ ] Secrets: ESO+SOPS or Vault; DATABASE_URL via Secret (not plain env)
+- [x] Secrets: ESO+SOPS or Vault; DATABASE_URL via Secret (not plain env)
 - [ ] CI immutability: switch Helm values to digests; GitOps PR to flux repo; env approvals
-- [ ] Ingress/Gateway: HTTPS via cert-manager; smoke tests
+- [x] Ingress/Gateway: HTTPS via cert-manager; smoke tests
 - [ ] Alerts & runbooks: Slack/webhook, SLOs, runbook URLs
-- [ ] RBAC & quotas: Role/RoleBinding; LimitRange/ResourceQuota
+- [x] RBAC & quotas: Role/RoleBinding; LimitRange/ResourceQuota
 - [ ] Ephemeral envs: PR previews; auto cleanup
 - [x] Tests: increase coverage; add DB/OTEL integration tests
 - [x] Prometheus rules applied by operator from repo (preferred) — rules file provided; flux integration present, CLI apply removed from CI

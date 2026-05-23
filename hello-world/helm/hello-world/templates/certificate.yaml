@@ -1,0 +1,29 @@
+{{- if .Values.certificate.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "hello-world.fullname" . }}-tls
+  labels:
+    {{- include "hello-world.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "hello-world.fullname" . }}-tls
+  duration: {{ .Values.certificate.duration | default "2160h" | quote }}
+  renewBefore: {{ .Values.certificate.renewBefore | default "360h" | quote }}
+  privateKey:
+    algorithm: {{ .Values.certificate.algorithm | default "ECDSA" }}
+    size: {{ .Values.certificate.size | default 256 }}
+    rotationPolicy: Always
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  dnsNames:
+    - {{ .Values.ingress.host | quote }}
+    {{- range .Values.certificate.extraDnsNames | default list }}
+    - {{ . | quote }}
+    {{- end }}
+  issuerRef:
+    name: {{ required "certificate.issuerRef.name is required when certificate.enabled=true" .Values.certificate.issuerRef.name }}
+    kind: {{ .Values.certificate.issuerRef.kind | default "ClusterIssuer" }}
+    group: {{ .Values.certificate.issuerRef.group | default "cert-manager.io" }}
+{{- end }}
