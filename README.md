@@ -67,11 +67,11 @@ Notes
 - [x] App: add /readyz & /livez, graceful shutdown
 - [x] App: add JSON logs with trace ids
 - [x] Secrets: ESO+SOPS or Vault; DATABASE_URL via Secret (not plain env)
-- [ ] CI immutability: switch Helm values to digests; GitOps PR to flux repo; env approvals
+- [x] CI immutability: switch Helm values to digests; GitOps PR to flux repo; env approvals
 - [x] Ingress/Gateway: HTTPS via cert-manager; smoke tests
-- [ ] Alerts & runbooks: Slack/webhook, SLOs, runbook URLs
+- [x] Alerts & runbooks: Slack/webhook, SLOs, runbook URLs
 - [x] RBAC & quotas: Role/RoleBinding; LimitRange/ResourceQuota
-- [ ] Ephemeral envs: PR previews; auto cleanup
+- [x] Ephemeral envs: PR previews; auto cleanup
 - [x] Tests: increase coverage; add DB/OTEL integration tests
 - [x] Prometheus rules applied by operator from repo (preferred) — rules file provided; flux integration present, CLI apply removed from CI
 - [x] Security scanners in CI: golangci-lint, gosec, govulncheck, Trivy (fs+image), ZAP baseline
@@ -94,11 +94,11 @@ This design implies only two env's - non-prod and prod.
  - non-prod - it is `shared` with dev/stage/demo/preview or any other without real load
  - prod is a prod :)
 
-https://github.com/IgorGerasimow/platform-design - this repository contain: 
- - generic helm chart https://github.com/IgorGerasimow/platform-design/tree/main/helm
- - terragrunt for spinning up aws resources https://github.com/IgorGerasimow/platform-design/tree/main/terragrunt
- - example of Argocd apps and deploys https://github.com/IgorGerasimow/platform-design/tree/main/apps
- - git hub pipelines  https://github.com/IgorGerasimow/platform-design/tree/main/.github/workflows  
+https://github.com/100rd/platform-design - this repository contain: 
+ - generic helm chart https://github.com/100rd/platform-design/tree/main/helm
+ - terragrunt for spinning up aws resources https://github.com/100rd/platform-design/tree/main/terragrunt
+ - example of Argocd apps and deploys https://github.com/100rd/platform-design/tree/main/apps
+ - git hub pipelines  https://github.com/100rd/platform-design/tree/main/.github/workflows  
 
 <img src="docs/12factor.svg" alt="12-Factor overview" width="800"/>
 
@@ -226,3 +226,113 @@ helm upgrade --install hello-world ./hello-world/helm/hello-world   --namespace 
 - Default-deny `NetworkPolicy` with explicit egress to Postgres and OTEL collector (adjust selectors to your environment).
 
 The Helm chart exposes probe paths via `values.yaml` under `healthProbes` so you can override them per environment if desired.
+
+## Phase C — Delivery hardening
+
+Phase C closes the last three TBD items (3, 5, 7): immutable image
+references via digest, full Alertmanager routing + runbooks + SLO
+burn-rate alerts, and ephemeral PR-preview environments with auto
+cleanup.
+
+### Immutable image references (digest precedence)
+
+The chart prefers `image.digest` over `image.tag`. When `image.digest`
+is set (non-empty, must start with `sha256:`), the Deployment renders
+`repository@digest`; otherwise it falls back to `repository:tag`.
+
+```yaml
+# values.yaml (snippet)
+image:
+  repository: ghcr.io/your-org/hello-world
+  digest: ""           # set this for immutable references (preferred)
+  tag: "latest"        # used only when digest is empty
+```
+
+CI captures the image digest after `docker push` (step output
+`image_digest` on the `lint-build-test` job) and feeds it into the
+`gitops-pr` job, which opens a PR in `100rd/platform-design` updating
+`spec.values.image.digest` (and clearing `image.tag`).
+
+#### Required secrets
+
+| Secret | Purpose | Where to add |
+| --- | --- | --- |
+| `PLATFORM_DESIGN_TOKEN` | Fine-grained PAT with write access to PRs and contents in `100rd/platform-design` ONLY | `https://github.com/100rd/Creme-ala-creme/settings/secrets/actions` |
+| `KUBE_CONFIG_B64` | Base64 kubeconfig for the cluster that hosts PR previews. Optional — when absent, PR-preview workflow runs dry-run only | same |
+
+#### Required environment ("prod") for manual approval
+
+The `deploy` job declares `environment: prod`. To enforce manual
+approval before each prod rollout:
+
+1. Open `https://github.com/100rd/Creme-ala-creme/settings/environments`
+2. Click "New environment" → name it `prod`
+3. Under "Deployment protection rules" → "Required reviewers", add the
+   on-call engineer(s) who must approve.
+
+Until reviewers are configured the deploy job will simply queue and
+proceed; configuring reviewers turns it into a manual gate.
+
+### Alerts, runbooks, and SLO burn-rate alerts
+
+`alertmanager/alertmanager.yml` routes by `severity`:
+
+| Severity | Receiver | Channel |
+| --- | --- | --- |
+| critical | `slack-oncall` | `#oncall` (paging) |
+| warning  | `slack-monitoring` | `#monitoring` |
+| info     | `null` | dropped (log-only) |
+
+Inhibit rules suppress lower-severity copies of an alert when the
+critical counterpart is firing for the same service, and
+`HelloWorldTargetDown` inhibits all downstream symptom alerts for the
+same service.
+
+`hello-world/monitoring/prometheus-rules.yaml` adds **multi-window
+multi-burn-rate** SLO alerts (Google SRE workbook ch.5) for a 99.9%
+availability target over a 30-day window:
+
+| Alert | Burn rate | Window | Severity |
+| --- | --- | --- | --- |
+| `HelloWorldSLOBurnFast1h` | 14.4x | 1h + 5m | critical |
+| `HelloWorldSLOBurnFast6h` | 6x   | 6h + 30m | critical |
+| `HelloWorldSLOBurnSlow1d` | 3x   | 1d + 1h | warning |
+| `HelloWorldSLOBurnSlow3d` | 1x   | 3d + 6h | warning |
+
+Every alert carries a `runbook_url` annotation pointing to
+`docs/runbooks/<alert-name>.md`. Runbooks contain symptoms, immediate
+actions, escalation, and dashboard links.
+
+Validate locally:
+
+```bash
+promtool check rules hello-world/monitoring/prometheus-rules.yaml
+amtool check-config alertmanager/alertmanager.yml
+```
+
+### Ephemeral PR-preview environments
+
+`.github/workflows/pr-preview.yml` runs on every pull request. With
+`KUBE_CONFIG_B64` configured, it deploys the chart into namespace
+`pr-<PR_NUMBER>` using `hello-world/helm/hello-world/values-preview.yaml`
+and comments the preview URL on the PR. The `cleanup` job (triggered by
+`pull_request.closed`) tears the namespace down.
+
+Without `KUBE_CONFIG_B64`, the workflow falls back to a dry-run path:
+`helm lint` + `helm template` + `kubeconform -strict`, plus a sticky PR
+comment showing what *would* be deployed.
+
+Local test of the preview overlay:
+
+```bash
+helm upgrade --install hello-world-pr-999 ./hello-world/helm/hello-world \
+  --namespace pr-999 --create-namespace \
+  -f hello-world/helm/hello-world/values-preview.yaml \
+  --set ingress.host=pr-999.hello-world.local \
+  --set image.repository=traefik/whoami --set image.tag=latest \
+  --set-string 'command[0]=/whoami,command[1]=--port,command[2]=8080' \
+  --wait --timeout=3m
+# ...verify pod / Certificate / ExternalSecret / Ingress, then:
+helm uninstall hello-world-pr-999 -n pr-999
+kubectl delete ns pr-999
+```
