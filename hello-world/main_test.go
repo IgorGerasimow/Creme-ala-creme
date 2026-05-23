@@ -12,7 +12,7 @@ import (
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
-	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 func TestGetBoolEnv(t *testing.T) {
@@ -39,7 +39,7 @@ func TestGetBoolEnv(t *testing.T) {
 			if tt.set {
 				t.Setenv(envVar, tt.value)
 			} else {
-				os.Unsetenv(envVar)
+				_ = os.Unsetenv(envVar)
 			}
 
 			if got := getBoolEnv(envVar, tt.def); got != tt.expect {
@@ -66,7 +66,7 @@ func TestTracingExportsAfterAdminEnable(t *testing.T) {
 	shutdownTracerProvider(context.Background())
 
 	// Use a noop provider for OpenFeature evaluations
-	openfeature.SetProvider(openfeature.NewNoopProvider())
+	_ = openfeature.SetProvider(openfeature.NoopProvider{})
 	ofClient = openfeature.NewClient("test")
 
 	exp := tracetest.NewInMemoryExporter()
@@ -80,7 +80,7 @@ func TestTracingExportsAfterAdminEnable(t *testing.T) {
 	defer func() {
 		tracerProviderFactory = initTracer
 		shutdownTracerProvider(context.Background())
-		otel.SetTracerProvider(trace.NewNoopTracerProvider())
+		otel.SetTracerProvider(tracenoop.NewTracerProvider())
 	}()
 
 	if tracerInitialized.Load() {

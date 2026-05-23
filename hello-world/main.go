@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -12,11 +13,14 @@ import (
 	"time"
 
 	migrate "github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/rs/zerolog"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -56,7 +60,11 @@ func (c dependencyChecker) pingDatabase(ctx context.Context) error {
 
 func (c dependencyChecker) readinessHandler(w http.ResponseWriter, r *http.Request) {
 	if err := c.pingDatabase(r.Context()); err != nil {
-		logger.Warn().Err(err).Msg("readiness check failed")
+		// Use safeErr to strip any DSN/credential substring the driver
+		// might have embedded in the error message.
+		loggerFromContext(r.Context()).Warn().
+			Str("error", safeErr(err)).
+			Msg("readiness check failed")
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
 	}
@@ -72,6 +80,8 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Content-Security-Policy", "default-src 'none'")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -118,9 +128,11 @@ func getBoolEnv(name string, def bool) bool {
 	}
 }
 
+// helloHandler responds with a fixed greeting and records metrics when the
+// metrics feature flag is enabled. Access logging is handled centrally by
+// accessLogMiddleware, so this function does not log per-request lines.
 func helloHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	// Dynamic tracing flag (OpenFeature override-able)
 	if isTracingEnabled(ctx) {
 		var span trace.Span
 		ctx, span = otel.Tracer("hello-world").Start(ctx, "helloHandler")
@@ -130,20 +142,12 @@ func helloHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("hello world"))
-	dur := time.Since(start).Seconds()
+
 	if isMetricsEnabled(ctx) && mtr != nil {
+		dur := time.Since(start).Seconds()
 		mtr.reqCount.WithLabelValues("/", r.Method, "200").Inc()
 		mtr.reqDuration.WithLabelValues("/", r.Method).Observe(dur)
 	}
-
-	loggerFromContext(ctx).Info().
-		Str("method", r.Method).
-		Str("path", r.URL.Path).
-		Str("remote_addr", r.RemoteAddr).
-		Str("user_agent", r.UserAgent()).
-		Int("status", http.StatusOK).
-		Float64("duration_seconds", dur).
-		Msg("handled request")
 }
 
 func initTracer(ctx context.Context) (func(context.Context) error, error) {
@@ -177,59 +181,15 @@ func initTracer(ctx context.Context) (func(context.Context) error, error) {
 	return tp.Shutdown, nil
 }
 
-func main() {
-	// Initialize structured JSON logger
-	initLogger()
-
-	logger.Info().
-		Str("version", version).
-		Msg("starting hello-world application")
-
-	// Feature flags defaults via env vars
-	metricsDefault := getBoolEnv("ENABLE_METRICS", false)
-	tracingDefault := getBoolEnv("ENABLE_TRACING", false)
-	adminFlagsEnabled := getBoolEnv("ADMIN_FLAGS_ENABLED", false)
-
-	// Initialize OpenFeature (flagd) client for dynamic flags
-	initFeatureFlags(tracingDefault, metricsDefault)
-
-	var (
-		db    *sql.DB
-		err   error
-		dbURL = os.Getenv("DATABASE_URL")
-	)
-	if dbURL != "" {
-		db, err = setupDatabase(dbURL)
-		if err != nil {
-			logger.Fatal().Err(err).Msg("database initialization failed")
-		}
-		defer func() {
-			if cerr := db.Close(); cerr != nil {
-				logger.Error().Err(cerr).Msg("database close error")
-			}
-		}()
-	} else {
-		logger.Info().Msg("DATABASE_URL not set, skipping database setup")
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	defer shutdownTracerProvider(context.Background())
-	if tracingDefault {
-		ensureTracerProvider(ctx)
-	}
-
-	// Always register metrics collectors; recording/serving is gated dynamically
-	mtr = enableMetrics()
-
-	checker := dependencyChecker{db: db}
-
+// buildMux assembles the routing tree. It is pure (no side effects beyond
+// global Prometheus metrics collectors registered once by enableMetrics) so
+// that tests can exercise the exact production routing.
+func buildMux(checker dependencyChecker, adminFlagsEnabled bool) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", helloHandler)
 	mux.HandleFunc("/readyz", checker.readinessHandler)
 	mux.HandleFunc("/livez", checker.livenessHandler)
 
-	// Metrics endpoint gated dynamically per-request
 	promHandler := promhttp.Handler()
 	mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !isMetricsEnabled(r.Context()) {
@@ -240,35 +200,96 @@ func main() {
 		promHandler.ServeHTTP(w, r)
 	}))
 
-	// Admin flags (local/dev): GET returns current; POST sets; POST /reset clears overrides
 	if adminFlagsEnabled {
 		mux.HandleFunc("/admin/flags", adminAuthMiddleware(adminFlagsHandler))
 		mux.HandleFunc("/admin/flags/reset", adminAuthMiddleware(adminFlagsResetHandler))
-		hasAuth := os.Getenv("ADMIN_API_KEY") != ""
-		if hasAuth {
-			logger.Info().Msg("Admin flags endpoint enabled with API key authentication: /admin/flags")
+		if os.Getenv("ADMIN_API_KEY") != "" {
+			logger.Info().Msg("admin flags endpoint enabled with API key authentication")
 		} else {
-			logger.Warn().Msg("Admin flags endpoint enabled WITHOUT authentication (dev mode only): /admin/flags")
+			logger.Warn().Msg("admin flags endpoint enabled WITHOUT authentication (dev only)")
 		}
 	}
+	return mux
+}
 
-	addr := ":8080"
-	if p := os.Getenv("PORT"); p != "" {
-		addr = ":" + p
-	}
-	srv := &http.Server{
+// buildServer wraps mux in the request middleware chain and applies the
+// standard production timeouts. addr should be a value suitable for
+// http.Server.Addr (e.g., ":8080").
+func buildServer(addr string, mux http.Handler) *http.Server {
+	return &http.Server{
 		Addr:              addr,
-		Handler:           securityHeaders(mux),
+		Handler:           accessLogMiddleware(securityHeaders(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1MB
 	}
+}
 
+// resolveListenAddr returns ":<PORT>" when PORT is set, ":8080" otherwise.
+func resolveListenAddr() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return ":" + p
+	}
+	return ":8080"
+}
+
+// initApp performs the application bootstrap that does not require the
+// server to run. It is split from main() so tests can exercise the
+// configuration path without binding a TCP port. Returns the assembled
+// http.Server and a cleanup callback the caller must defer.
+func initApp() (*http.Server, func(), error) {
+	initLogger()
+	// "version" is already part of every log line via initLogger; emit a
+	// dedicated startup event for log-search visibility.
+	logger.Info().Msg("starting hello-world application")
+
+	metricsDefault := getBoolEnv("ENABLE_METRICS", false)
+	tracingDefault := getBoolEnv("ENABLE_TRACING", false)
+	adminFlagsEnabled := getBoolEnv("ADMIN_FLAGS_ENABLED", false)
+
+	initFeatureFlags(tracingDefault, metricsDefault)
+
+	var db *sql.DB
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL != "" {
+		var err error
+		db, err = setupDatabase(dbURL)
+		if err != nil {
+			return nil, func() {}, fmt.Errorf("database initialization: %w", err)
+		}
+	} else {
+		logger.Info().Msg("DATABASE_URL not set, skipping database setup")
+	}
+
+	if tracingDefault {
+		ensureTracerProvider(context.Background())
+	}
+
+	mtr = enableMetrics()
+
+	checker := dependencyChecker{db: db}
+	srv := buildServer(resolveListenAddr(), buildMux(checker, adminFlagsEnabled))
+
+	cleanup := func() {
+		shutdownTracerProvider(context.Background())
+		if db != nil {
+			if cerr := db.Close(); cerr != nil {
+				logger.Error().Str("error", safeErr(cerr)).Msg("database close error")
+			}
+		}
+	}
+	return srv, cleanup, nil
+}
+
+// runServer blocks until either the server fails or a SIGINT/SIGTERM is
+// received. It performs a graceful shutdown with a 10s timeout. Returns any
+// non-Recoverable server error.
+func runServer(srv *http.Server) error {
 	serverErr := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
 		close(serverErr)
@@ -278,29 +299,46 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	logger.Info().
-		Str("addr", addr).
-		Bool("admin_flags_enabled", adminFlagsEnabled).
-		Msg("server started")
+	logger.Info().Str("addr", srv.Addr).Msg("server started")
 
 	select {
 	case err := <-serverErr:
-		if err != nil {
-			logger.Fatal().Err(err).Msg("server failed")
-		}
+		return err
 	case sig := <-sigCh:
 		logger.Info().Str("signal", sig.String()).Msg("received shutdown signal")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			logger.Error().Err(err).Msg("server shutdown error")
+			logger.Error().Str("error", safeErr(err)).Msg("server shutdown error")
 		}
-		cancel()
 		<-serverErr
+		return nil
 	}
 }
 
+func main() {
+	srv, cleanup, err := initApp()
+	if err != nil {
+		// initLogger has already run inside initApp on the happy path; in
+		// the error path we still need a usable logger.
+		if logger.GetLevel() == zerolog.Disabled {
+			initLogger()
+		}
+		logger.Fatal().Str("error", safeErr(err)).Msg("application init failed")
+	}
+	defer cleanup()
+	if err := runServer(srv); err != nil {
+		logger.Fatal().Str("error", safeErr(err)).Msg("server failed")
+	}
+}
+
+// dbStartupTimeout is the maximum duration setupDatabase will wait for a
+// successful Ping before giving up. It is a package-level variable rather
+// than a constant so tests can shorten it.
+var dbStartupTimeout = 45 * time.Second
+
 func setupDatabase(databaseURL string) (*sql.DB, error) {
-	db, err := waitForDatabase(databaseURL, 45*time.Second)
+	db, err := waitForDatabase(databaseURL, dbStartupTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -313,7 +351,7 @@ func setupDatabase(databaseURL string) (*sql.DB, error) {
 	}
 
 	if err := runMigrations(db); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return db, nil
@@ -336,7 +374,7 @@ func waitForDatabase(databaseURL string, timeout time.Duration) (*sql.DB, error)
 		if pingErr == nil {
 			return db, nil
 		}
-		db.Close()
+		_ = db.Close()
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("database not reachable within deadline: %w", pingErr)
 		}
@@ -344,24 +382,46 @@ func waitForDatabase(databaseURL string, timeout time.Duration) (*sql.DB, error)
 	}
 }
 
+// runMigrations applies any pending migrations from /migrations on the
+// container filesystem. It is a thin convenience wrapper around
+// runMigrationsFromSource so tests can drive the same code against a local
+// directory.
 func runMigrations(db *sql.DB) error {
+	driver, err := pgDriver(db)
+	if err != nil {
+		return err
+	}
+	return runMigrationsFromSource("file:///migrations", driver)
+}
+
+// pgDriver wraps postgres.WithInstance with error wrapping for clearer
+// diagnostics.
+func pgDriver(db *sql.DB) (database.Driver, error) {
 	driver, err := postgres.WithInstance(db, &postgres.Config{})
 	if err != nil {
-		return fmt.Errorf("create driver: %w", err)
+		return nil, fmt.Errorf("create driver: %w", err)
 	}
+	return driver, nil
+}
 
-	m, err := migrate.NewWithDatabaseInstance("file:///migrations", "postgres", driver)
+// runMigrationsFromSource applies migrations from the given source URL using
+// the supplied driver. Logs progress; returns nil when the source has no
+// pending changes.
+func runMigrationsFromSource(sourceURL string, driver database.Driver) error {
+	m, err := migrate.NewWithDatabaseInstance(sourceURL, "postgres", driver)
 	if err != nil {
 		return fmt.Errorf("new migrate: %w", err)
 	}
 
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		return fmt.Errorf("migrate up: %w", err)
-	}
-	if err == migrate.ErrNoChange {
-		logger.Info().Msg("migrations: no change")
-	} else {
+	err = m.Up()
+	switch {
+	case err == nil:
 		logger.Info().Msg("migrations: applied successfully")
+	case errors.Is(err, migrate.ErrNoChange):
+		logger.Info().Msg("migrations: no change")
+		return nil
+	default:
+		return fmt.Errorf("migrate up: %w", err)
 	}
 	return nil
 }

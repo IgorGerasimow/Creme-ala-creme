@@ -1,0 +1,19 @@
+# github.com/docker/docker is pulled in transitively by testcontainers-go
+# (build tag `integration` only). It is NOT compiled into the production
+# binary (Dockerfile builds `go build .` with no integration tag), only
+# into test binaries built locally and in CI for integration runs.
+#
+# All three CVEs below are tracked but cannot be remediated without
+# breaking the integration test stack:
+#
+#   CVE-2026-34040: fixed in docker v29.3.1+, but v28/v29 removed the
+#     archive.Compression type that testcontainers-go v0.35 depends on
+#     (build breaks at github.com/docker/docker/pkg/archive).
+#   CVE-2026-41567: status "affected" with no fix in any docker release.
+#   CVE-2026-42306: status "affected" with no fix in any docker release.
+#
+# Re-evaluate when testcontainers-go releases a version compatible with
+# docker v29+, or when these CVEs receive an upstream fix.
+CVE-2026-34040
+CVE-2026-41567
+CVE-2026-42306
