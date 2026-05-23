@@ -1,0 +1,255 @@
+name: PR Preview
+
+# Spin up an ephemeral preview environment for every open pull request.
+#
+# When the optional repo secret `KUBE_CONFIG_B64` is configured, the
+# workflow installs the chart into a per-PR namespace `pr-<N>` and
+# comments on the PR with the preview URL.
+#
+# When KUBE_CONFIG_B64 is NOT set (the default for this repo today),
+# the workflow runs a deploy-time *dry-run* — helm template + kubeconform
+# validation + comment with a snippet of the rendered manifest. This
+# proves the preview overlay still renders cleanly for the proposed
+# change without requiring cluster access.
+#
+# Cleanup runs on PR `closed` (merged or not): the per-PR namespace is
+# deleted (or, in dry-run mode, a "preview cleaned up" comment is posted).
+#
+# Security:
+#   - Uses `pull_request` (NOT pull_request_target) so workflow
+#     definitions from forks cannot escalate.
+#   - Permissions are scoped per-job to the minimum needed.
+#   - No AWS / cluster credentials are exposed to fork PRs.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+
+# Cancel in-flight preview builds for the same PR when a new push arrives.
+concurrency:
+  group: pr-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  PREVIEW_NS: pr-${{ github.event.pull_request.number }}
+  PREVIEW_RELEASE: hello-world-pr-${{ github.event.pull_request.number }}
+  PREVIEW_HOST: pr-${{ github.event.pull_request.number }}.hello-world.local
+  IMAGE_NAME: hello-world
+
+jobs:
+  # ---------------------------------------------------------------------
+  # render: always-run. Helm template + kubeconform. Acts as the dry-run
+  # path when no cluster credentials are configured, and as a pre-deploy
+  # gate when they are.
+  # ---------------------------------------------------------------------
+  render:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      has_cluster_creds: ${{ steps.creds.outputs.has_cluster_creds }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Detect cluster credentials
+        id: creds
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          if [ -n "${KUBE_CONFIG_B64}" ]; then
+            echo "has_cluster_creds=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cluster_creds=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.16.4
+
+      - name: Install kubeconform
+        run: |
+          curl -fsSL -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp
+          sudo install /tmp/kubeconform /usr/local/bin/kubeconform
+          kubeconform -v
+
+      - name: Helm lint
+        run: helm lint hello-world/helm/hello-world
+
+      - name: Helm template (preview overlay)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/preview
+          helm template "${PREVIEW_RELEASE}" hello-world/helm/hello-world \
+            -n "${PREVIEW_NS}" --create-namespace \
+            -f hello-world/helm/hello-world/values-preview.yaml \
+            --set ingress.host="${PREVIEW_HOST}" \
+            --set image.repository="${IMAGE_NAME}" \
+            --set image.tag="pr-${PR_NUMBER}" \
+            > /tmp/preview/manifest.yaml
+          echo "Rendered $(wc -l < /tmp/preview/manifest.yaml) lines"
+
+      - name: kubeconform validate
+        run: |
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/preview/manifest.yaml
+
+      - name: Comment dry-run preview on PR
+        if: steps.creds.outputs.has_cluster_creds == 'false'
+        uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728 # v2.9.1
+        with:
+          header: pr-preview
+          message: |
+            ### PR Preview (dry-run)
+
+            Cluster credentials (`KUBE_CONFIG_B64`) are not configured for this repo,
+            so the preview ran as a **dry-run**: `helm lint` + `helm template` +
+            `kubeconform -strict`. Add the secret to enable live previews.
+
+            - Preview namespace (planned): `${{ env.PREVIEW_NS }}`
+            - Preview host (planned): `https://${{ env.PREVIEW_HOST }}`
+            - Image: `${{ env.IMAGE_NAME }}:pr-${{ env.PR_NUMBER }}`
+            - Render: ok
+            - kubeconform: ok
+
+            Configure `KUBE_CONFIG_B64` at
+            https://github.com/100rd/Creme-ala-creme/settings/secrets/actions to
+            enable live previews.
+
+  # ---------------------------------------------------------------------
+  # deploy: only when cluster credentials are configured. Loads kubeconfig,
+  # installs the chart, waits for readiness, posts a comment with the URL.
+  # ---------------------------------------------------------------------
+  deploy:
+    needs: render
+    if: github.event.action != 'closed' && needs.render.outputs.has_cluster_creds == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.16.4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@3e0aec4d80787158d308d7b364cb1b702e7feb7f # v4.0.0
+        with:
+          version: v1.29.4
+
+      - name: Load kubeconfig
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl cluster-info
+
+      - name: Helm upgrade --install preview
+        run: |
+          set -euo pipefail
+          helm upgrade --install "${PREVIEW_RELEASE}" hello-world/helm/hello-world \
+            --namespace "${PREVIEW_NS}" --create-namespace \
+            -f hello-world/helm/hello-world/values-preview.yaml \
+            --set ingress.host="${PREVIEW_HOST}" \
+            --set image.repository="${IMAGE_NAME}" \
+            --set image.tag="pr-${PR_NUMBER}" \
+            --wait --timeout=5m
+
+      - name: Wait for Certificate ready
+        run: |
+          kubectl -n "${PREVIEW_NS}" wait \
+            --for=condition=Ready certificate \
+            --all --timeout=2m || echo "::warning::Certificate not Ready in 2m"
+
+      - name: Comment preview URL on PR
+        uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728 # v2.9.1
+        with:
+          header: pr-preview
+          message: |
+            ### PR Preview
+
+            - URL:        https://${{ env.PREVIEW_HOST }}
+            - Namespace:  `${{ env.PREVIEW_NS }}`
+            - Release:    `${{ env.PREVIEW_RELEASE }}`
+            - Image:      `${{ env.IMAGE_NAME }}:pr-${{ env.PR_NUMBER }}`
+
+            Useful commands:
+            ```
+            kubectl -n ${{ env.PREVIEW_NS }} get pods
+            kubectl -n ${{ env.PREVIEW_NS }} logs -l app.kubernetes.io/name=hello-world --tail=200
+            ```
+
+            The preview will be torn down automatically when this PR closes.
+
+  # ---------------------------------------------------------------------
+  # cleanup: PR closed (merged or otherwise). Tear down namespace + release.
+  # ---------------------------------------------------------------------
+  cleanup:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Detect cluster credentials
+        id: creds
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          if [ -n "${KUBE_CONFIG_B64}" ]; then
+            echo "has_cluster_creds=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cluster_creds=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install helm
+        if: steps.creds.outputs.has_cluster_creds == 'true'
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.16.4
+
+      - name: Install kubectl
+        if: steps.creds.outputs.has_cluster_creds == 'true'
+        uses: azure/setup-kubectl@3e0aec4d80787158d308d7b364cb1b702e7feb7f # v4.0.0
+        with:
+          version: v1.29.4
+
+      - name: Load kubeconfig
+        if: steps.creds.outputs.has_cluster_creds == 'true'
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Helm uninstall preview
+        if: steps.creds.outputs.has_cluster_creds == 'true'
+        run: |
+          set -euo pipefail
+          helm uninstall "${PREVIEW_RELEASE}" -n "${PREVIEW_NS}" --ignore-not-found || true
+          kubectl delete namespace "${PREVIEW_NS}" --ignore-not-found --wait=false || true
+
+      - name: Comment teardown on PR
+        uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728 # v2.9.1
+        with:
+          header: pr-preview
+          message: |
+            ### PR Preview — torn down
+
+            Namespace `${{ env.PREVIEW_NS }}` and release `${{ env.PREVIEW_RELEASE }}` removed.

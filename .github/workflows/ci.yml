@@ -23,6 +23,13 @@ env:
 jobs:
   lint-build-test:
     runs-on: ubuntu-latest
+    # Outputs surface the immutable image reference to downstream jobs
+    # (gitops-pr, deploy) so the GitOps PR can pin by digest, not by
+    # mutable tag.
+    outputs:
+      image_repo:   ${{ steps.image-ref.outputs.image_repo }}
+      image_tag:    ${{ steps.image-ref.outputs.image_tag }}
+      image_digest: ${{ steps.image-ref.outputs.image_digest }}
     defaults:
       run:
         working-directory: hello-world
@@ -188,6 +195,7 @@ jobs:
           echo "ECR_REGISTRY=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com" >> $GITHUB_ENV
 
       - name: Tag and push Docker image
+        id: image-ref
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release/')
         run: |
           set -euo pipefail
@@ -195,9 +203,17 @@ jobs:
           docker tag $IMAGE_NAME:ci $ECR_REGISTRY/$ECR_REPOSITORY:sha-${GITHUB_SHA}
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:${IMAGE_TAG}
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:sha-${GITHUB_SHA}
-          # Capture image digest for immutable reference
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $ECR_REGISTRY/$ECR_REPOSITORY:${IMAGE_TAG} 2>/dev/null || echo "")
+          # Capture image digest for immutable reference (used by gitops-pr).
+          REPO_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $ECR_REGISTRY/$ECR_REPOSITORY:${IMAGE_TAG} 2>/dev/null || echo "")
+          DIGEST="${REPO_DIGEST##*@}"
+          if [ -z "$DIGEST" ]; then
+            echo "::warning::Failed to capture image digest; gitops-pr will be skipped"
+          fi
           echo "IMAGE_DIGEST=${DIGEST}" >> $GITHUB_ENV
+          # Step outputs for downstream jobs.
+          echo "image_repo=${ECR_REGISTRY}/${ECR_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}"                       >> "$GITHUB_OUTPUT"
+          echo "image_digest=${DIGEST}"                       >> "$GITHUB_OUTPUT"
 
       - name: Sign image with cosign (keyless)
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/release/')
@@ -263,10 +279,109 @@ jobs:
           docker tag $IMAGE_NAME:pr-${{ github.event.number }} $ECR_REGISTRY/$ECR_REPOSITORY:pr-${{ github.event.number }}
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:pr-${{ github.event.number }}
 
-  deploy:
+  # ---------------------------------------------------------------------------
+  # gitops-pr — open a PR in the platform-design repo to update the
+  # hello-world HelmRelease to the new immutable image digest. Runs after
+  # the main-branch image push (digest is computed in lint-build-test and
+  # passed through GITHUB_ENV / a workflow artifact).
+  #
+  # Requires repo secret PLATFORM_DESIGN_TOKEN (fine-grained, write access
+  # ONLY to 100rd/platform-design pull requests + contents). If absent,
+  # the job logs a warning and exits 0 so the main pipeline does not
+  # break for forks / first-time runs.
+  # ---------------------------------------------------------------------------
+  gitops-pr:
     needs: lint-build-test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check for PLATFORM_DESIGN_TOKEN
+        id: token-check
+        env:
+          PLATFORM_DESIGN_TOKEN: ${{ secrets.PLATFORM_DESIGN_TOKEN }}
+        run: |
+          if [ -z "${PLATFORM_DESIGN_TOKEN}" ]; then
+            echo "PLATFORM_DESIGN_TOKEN not set — skipping GitOps PR. Configure the secret at https://github.com/100rd/Creme-ala-creme/settings/secrets/actions"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout platform-design
+        if: steps.token-check.outputs.skip == 'false'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: 100rd/platform-design
+          token: ${{ secrets.PLATFORM_DESIGN_TOKEN }}
+          ref: main
+          path: platform-design
+
+      - name: Update hello-world HelmRelease image digest
+        if: steps.token-check.outputs.skip == 'false'
+        env:
+          IMAGE_DIGEST: ${{ needs.lint-build-test.outputs.image_digest }}
+          IMAGE_TAG: ${{ needs.lint-build-test.outputs.image_tag }}
+          IMAGE_REPO: ${{ needs.lint-build-test.outputs.image_repo }}
+        working-directory: platform-design
+        run: |
+          set -euo pipefail
+          target="apps/direct/hello-world/helmrelease.yaml"
+          if [ ! -f "$target" ]; then
+            echo "Target file $target not found in platform-design; skipping"
+            exit 0
+          fi
+          # Strip "<repo>@" prefix from IMAGE_DIGEST if docker inspect returned a RepoDigest.
+          digest="${IMAGE_DIGEST##*@}"
+          # Update both image.repository and image.digest, and clear image.tag.
+          # yq v4 is preinstalled on ubuntu-latest.
+          IMAGE_REPO="$IMAGE_REPO" digest="$digest" yq -i '
+            .spec.values.image.repository = strenv(IMAGE_REPO) |
+            .spec.values.image.digest     = strenv(digest) |
+            .spec.values.image.tag        = ""
+          ' "$target"
+          echo "--- Updated $target ---"
+          cat "$target"
+
+      - name: Create Pull Request
+        if: steps.token-check.outputs.skip == 'false'
+        uses: peter-evans/create-pull-request@5e914681df9dc83aa4e4905692ca88beb2f9e91f # v7.0.5
+        with:
+          token: ${{ secrets.PLATFORM_DESIGN_TOKEN }}
+          path: platform-design
+          branch: bot/creme-bump-${{ github.sha }}
+          delete-branch: true
+          title: "chore(creme): bump hello-world to ${{ github.sha }}"
+          commit-message: |
+            chore(creme): bump hello-world image digest
+
+            Source commit: 100rd/Creme-ala-creme@${{ github.sha }}
+            Digest: ${{ needs.lint-build-test.outputs.image_digest }}
+          body: |
+            Automated bump from Creme-ala-creme CI.
+
+            - Source: https://github.com/100rd/Creme-ala-creme/commit/${{ github.sha }}
+            - Image digest: `${{ needs.lint-build-test.outputs.image_digest }}`
+            - Tag (informational): `${{ needs.lint-build-test.outputs.image_tag }}`
+          labels: |
+            automation
+            creme
+
+  deploy:
+    needs: [lint-build-test, gitops-pr]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # `environment: prod` triggers GitHub Actions environment protection
+    # rules. Configure required reviewers at:
+    #   https://github.com/100rd/Creme-ala-creme/settings/environments
+    #   -> "prod" -> "Required reviewers"
+    # Until reviewers are configured, this job will simply queue and
+    # auto-approve. Once reviewers are added, deploys to main pause for
+    # manual approval.
+    environment: prod
+    permissions:
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

@@ -61,3 +61,24 @@ Refuses to render the deployment otherwise.
 {{- fail "ADMIN_FLAGS_ENABLED=true requires ADMIN_API_KEY to be provided (set via envFromSecret.keys or env)" -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Image reference resolver: prefer image.digest over image.tag.
+- If .Values.image.digest is non-empty, returns "repository@digest"
+  (immutable reference, recommended for production / GitOps).
+- Otherwise returns "repository:tag".
+Validates the digest format (must start with "sha256:") when set.
+*/}}
+{{- define "hello-world.image" -}}
+{{- $repo := required "image.repository is required" .Values.image.repository -}}
+{{- $digest := .Values.image.digest | default "" -}}
+{{- if $digest -}}
+  {{- if not (hasPrefix "sha256:" $digest) -}}
+    {{- fail (printf "image.digest must start with 'sha256:' — got %q" $digest) -}}
+  {{- end -}}
+  {{- printf "%s@%s" $repo $digest -}}
+{{- else -}}
+  {{- $tag := .Values.image.tag | default "latest" -}}
+  {{- printf "%s:%s" $repo $tag -}}
+{{- end -}}
+{{- end -}}

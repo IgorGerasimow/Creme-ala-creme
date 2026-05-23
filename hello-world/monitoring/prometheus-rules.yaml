@@ -1,3 +1,21 @@
+# PrometheusRule for hello-world.
+#
+# Two rule groups:
+#   1. hello-world.general — direct symptom alerts (errors, latency, traffic).
+#   2. hello-world.slo     — multi-window multi-burn-rate SLO alerts.
+#
+# SLO target: 99.9% availability over a 30-day window, defined as the
+# fraction of HTTP requests returning 2xx out of all requests. The error
+# budget is therefore 0.1% (= 0.001) over 30 days.
+#
+# Multi-window multi-burn-rate alerting (Google SRE workbook, ch.5):
+#   - Fast burn (page):  2% of monthly budget in 1h    (burn rate 14.4)
+#   - Fast burn (page):  5% of monthly budget in 6h    (burn rate  6.0)
+#   - Slow burn (ticket): 10% of monthly budget in 1d/3d (burn rate 3/1)
+#
+# All alerts carry a `runbook_url` annotation pointing to docs in this
+# repo so on-call has one click to mitigation steps.
+
 groups:
   - name: hello-world.general
     rules:
@@ -12,6 +30,7 @@ groups:
           description: |
             No scrape targets are up for hello-world for more than 2 minutes.
             This usually indicates the service is unavailable or scraping is misconfigured.
+          runbook_url: "https://github.com/100rd/Creme-ala-creme/blob/main/docs/runbooks/HelloWorldTargetDown.md"
 
       - alert: HelloWorldHighErrorRate
         expr: |
@@ -28,6 +47,7 @@ groups:
           description: |
             The proportion of non-2xx responses exceeded 5% over the last 5 minutes.
             Investigate recent deployments, dependencies and upstreams.
+          runbook_url: "https://github.com/100rd/Creme-ala-creme/blob/main/docs/runbooks/HelloWorldHighErrorRate.md"
 
       - alert: HelloWorldHighLatencyP95
         expr: |
@@ -44,6 +64,7 @@ groups:
           description: |
             The 95th percentile latency is above 500ms over the last 5 minutes.
             Check resource saturation and downstream dependencies.
+          runbook_url: "https://github.com/100rd/Creme-ala-creme/blob/main/docs/runbooks/HelloWorldHighLatencyP95.md"
 
       - alert: HelloWorldNoTraffic
         expr: sum(rate(http_requests_total{job=~".*hello-world.*"}[10m])) by (job) == 0
@@ -55,6 +76,7 @@ groups:
           summary: "hello-world has no traffic"
           description: |
             No requests observed for 10 minutes. If this is unexpected, check routing and ingress.
+          runbook_url: "https://github.com/100rd/Creme-ala-creme/blob/main/docs/runbooks/HelloWorldNoTraffic.md"
 
       - alert: HelloWorldMetricsHandlerErrors
         expr: increase(promhttp_metric_handler_errors_total{job=~".*hello-world.*"}[5m]) > 0
@@ -67,5 +89,131 @@ groups:
           description: |
             The metrics endpoint reported encoding/serving errors in the last 10 minutes.
             This may indicate invalid metrics or memory pressure.
+          runbook_url: "https://github.com/100rd/Creme-ala-creme/blob/main/docs/runbooks/HelloWorldMetricsHandlerErrors.md"
 
+  # ---------------------------------------------------------------------------
+  # SLO: 99.9% availability over 30 days.
+  # Error ratio = non-2xx / total. Budget = 1 - SLO = 0.001.
+  # Burn rate = error_ratio / 0.001 = error_ratio * 1000.
+  # ---------------------------------------------------------------------------
+  - name: hello-world.slo
+    rules:
+      # Recording rules: compute error_ratio over multiple windows once,
+      # alert expressions reuse them. Cheaper at evaluation time and easier
+      # to inspect in Prometheus UI.
+      - record: job:hello_world_request_errors:ratio_rate5m
+        expr: |
+          sum(rate(http_requests_total{job=~".*hello-world.*",status!~"2.."}[5m])) by (job)
+          /
+          sum(rate(http_requests_total{job=~".*hello-world.*"}[5m])) by (job)
 
+      - record: job:hello_world_request_errors:ratio_rate30m
+        expr: |
+          sum(rate(http_requests_total{job=~".*hello-world.*",status!~"2.."}[30m])) by (job)
+          /
+          sum(rate(http_requests_total{job=~".*hello-world.*"}[30m])) by (job)
+
+      - record: job:hello_world_request_errors:ratio_rate1h
+        expr: |
+          sum(rate(http_requests_total{job=~".*hello-world.*",status!~"2.."}[1h])) by (job)
+          /
+          sum(rate(http_requests_total{job=~".*hello-world.*"}[1h])) by (job)
+
+      - record: job:hello_world_request_errors:ratio_rate6h
+        expr: |
+          sum(rate(http_requests_total{job=~".*hello-world.*",status!~"2.."}[6h])) by (job)
+          /
+          sum(rate(http_requests_total{job=~".*hello-world.*"}[6h])) by (job)
+
+      - record: job:hello_world_request_errors:ratio_rate1d
+        expr: |
+          sum(rate(http_requests_total{job=~".*hello-world.*",status!~"2.."}[1d])) by (job)
+          /
+          sum(rate(http_requests_total{job=~".*hello-world.*"}[1d])) by (job)
+
+      - record: job:hello_world_request_errors:ratio_rate3d
+        expr: |
+          sum(rate(http_requests_total{job=~".*hello-world.*",status!~"2.."}[3d])) by (job)
+          /
+          sum(rate(http_requests_total{job=~".*hello-world.*"}[3d])) by (job)
+
+      # Fast burn — page on-call.
+      # 2% budget burn in 1h corresponds to burn_rate >= 14.4. We require
+      # BOTH a short (5m) and the long (1h) window to be above the
+      # threshold: the short window prevents alerting on stale data, the
+      # long one prevents alerting on momentary spikes.
+      - alert: HelloWorldSLOBurnFast1h
+        expr: |
+          job:hello_world_request_errors:ratio_rate1h  > (14.4 * 0.001)
+          and
+          job:hello_world_request_errors:ratio_rate5m  > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: critical
+          service: hello-world
+          slo: availability-99-9
+          window: 1h
+        annotations:
+          summary: "hello-world fast SLO burn (1h window, 14.4x budget rate)"
+          description: |
+            At the current error rate, the 30-day error budget would be
+            consumed in roughly 2 days. Mitigation should start immediately.
+          runbook_url: "https://github.com/100rd/Creme-ala-creme/blob/main/docs/runbooks/HelloWorldSLOBurnFast.md"
+
+      # 6h window: 5% of monthly budget burn implies burn_rate >= 6.
+      - alert: HelloWorldSLOBurnFast6h
+        expr: |
+          job:hello_world_request_errors:ratio_rate6h  > (6 * 0.001)
+          and
+          job:hello_world_request_errors:ratio_rate30m > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: critical
+          service: hello-world
+          slo: availability-99-9
+          window: 6h
+        annotations:
+          summary: "hello-world fast SLO burn (6h window, 6x budget rate)"
+          description: |
+            Sustained burn over the past 6 hours indicates the monthly
+            error budget will be exhausted within ~5 days.
+          runbook_url: "https://github.com/100rd/Creme-ala-creme/blob/main/docs/runbooks/HelloWorldSLOBurnFast.md"
+
+      # Slow burn — open a ticket, no page.
+      # 10% of monthly budget burn over 1d implies burn_rate >= 3.
+      - alert: HelloWorldSLOBurnSlow1d
+        expr: |
+          job:hello_world_request_errors:ratio_rate1d  > (3 * 0.001)
+          and
+          job:hello_world_request_errors:ratio_rate1h  > (3 * 0.001)
+        for: 1h
+        labels:
+          severity: warning
+          service: hello-world
+          slo: availability-99-9
+          window: 1d
+        annotations:
+          summary: "hello-world slow SLO burn (1d window, 3x budget rate)"
+          description: |
+            Slow but persistent error rate over 24 hours. Budget will be
+            exhausted within ~10 days at this pace. File a ticket and
+            investigate during business hours.
+          runbook_url: "https://github.com/100rd/Creme-ala-creme/blob/main/docs/runbooks/HelloWorldSLOBurnSlow.md"
+
+      - alert: HelloWorldSLOBurnSlow3d
+        expr: |
+          job:hello_world_request_errors:ratio_rate3d  > (1 * 0.001)
+          and
+          job:hello_world_request_errors:ratio_rate6h  > (1 * 0.001)
+        for: 3h
+        labels:
+          severity: warning
+          service: hello-world
+          slo: availability-99-9
+          window: 3d
+        annotations:
+          summary: "hello-world slow SLO burn (3d window, 1x budget rate)"
+          description: |
+            Error rate matches the steady-state budget burn over 3 days.
+            Investigate root cause before the next deploy.
+          runbook_url: "https://github.com/100rd/Creme-ala-creme/blob/main/docs/runbooks/HelloWorldSLOBurnSlow.md"
